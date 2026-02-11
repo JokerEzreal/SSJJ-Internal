@@ -296,9 +296,8 @@ static void apply_aimbot() {
         if (!p.valid || p.is_local || p.is_dead) continue;
         if (p.max_hp <= 0.0f) continue;
 
-        // Skip teammates
-        if (!local_data.team_name.empty() && !p.team_name.empty() &&
-            local_data.team_name == p.team_name)
+        // Skip teammates (same in-game team index)
+        if (local_data.team_id >= 0 && p.team_id == local_data.team_id)
             continue;
 
         // Target head position - prefer actual head bone transform

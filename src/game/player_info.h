@@ -22,6 +22,7 @@ struct PlayerData {
     int entity_id = 0;
     int64_t cid = 0;
     std::string team_name;
+    int team_id = -1;   // in-game team index (from PlayerEntityData.Team)
 
     // Health
     float hp = 0.0f;

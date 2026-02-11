@@ -107,7 +107,8 @@ static void dump_data_to_file() {
     f << "=== LOCAL PLAYER ===\n";
     if (s_local_player.valid) {
         f << "Name: " << s_local_player.name << "\n";
-        f << "Team: " << s_local_player.team_name << "\n";
+        f << "TeamName: " << s_local_player.team_name << "\n";
+        f << "TeamID: " << s_local_player.team_id << "\n";
         f << "HP: " << s_local_player.hp << "/" << s_local_player.max_hp << "\n";
         f << "Dead: " << (s_local_player.is_dead ? "YES" : "NO") << "\n";
         f << "EntityID: " << s_local_player.entity_id << "\n";
@@ -137,7 +138,8 @@ static void dump_data_to_file() {
           << (p.is_local ? " [LOCAL]" : "")
           << (p.is_dead ? " [DEAD]" : "") << " ---\n";
         f << "Name: " << p.name << "\n";
-        f << "Team: " << p.team_name << "\n";
+        f << "TeamName: " << p.team_name << "\n";
+        f << "TeamID: " << p.team_id << "\n";
         f << "HP: " << p.hp << "/" << p.max_hp << "\n";
         f << "EntityID: " << p.entity_id << "\n";
         f << "CID: " << p.cid << "\n";
@@ -369,8 +371,8 @@ void on_gui() {
             y += LINE_H + GAP;
         } else {
             gui::label({x, y, w, LINE_H},
-                fmt("Name: %s  |  Team: %s",
-                    s_local_player.name.c_str(), s_local_player.team_name.c_str()));
+                fmt("Name: %s  |  TeamID: %d",
+                    s_local_player.name.c_str(), s_local_player.team_id));
             y += LINE_H + GAP;
 
             gui::label({x, y, w, LINE_H},
@@ -410,10 +412,10 @@ void on_gui() {
             }
 
             gui::label({x, y, w, LINE_H},
-                fmt("#%d %s%s T:%s HP:%.0f/%.0f",
+                fmt("#%d %s%s T:%d HP:%.0f/%.0f",
                     i + 1, p.name.c_str(),
                     p.is_dead ? "[D]" : "",
-                    p.team_name.c_str(), p.hp, p.max_hp));
+                    p.team_id, p.hp, p.max_hp));
             y += LINE_H + GAP;
         }
 

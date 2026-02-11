@@ -682,12 +682,19 @@ void draw() {
     // ------ Fetch all player data from player_info module ------
     std::vector<player_info::PlayerData> players = player_info::read_all_players();
 
+    // Read local player's team_id for teammate filtering
+    player_info::PlayerData local_data = player_info::read_local_player();
+    int local_team = local_data.valid ? local_data.team_id : -1;
+
     int w2s_ok = 0, w2s_fail = 0, drawn = 0;
     float first_sx = 0, first_sy = 0;
 
     for (const auto& p : players) {
         // Skip invalid, local, or dead players
         if (!p.valid || p.is_local || p.is_dead) continue;
+
+        // Skip teammates (same team_id as local player)
+        if (local_team >= 0 && p.team_id == local_team) continue;
 
         // --- SSJJ -> Unity coordinate conversion ---
         // Position is now properly decrypted (Seed scaling removed) via GetCompenstatePos
@@ -847,8 +854,10 @@ void draw() {
                             static MonoMethod* s_has_comp = nullptr;
                             static MonoMethod* s_get_basic_info = nullptr;
                             static MonoMethod* s_basic_get_is_dead = nullptr;
+                            static MonoClassField* s_basic_current_field = nullptr;
+                            static MonoMethod* s_entity_data_get_team = nullptr;
 
-                            // Resolve death-check methods once
+                            // Resolve death-check and team-check methods once
                             if (!s_get_basic_info) {
                                 MonoClass* pe = mono::class_from_name(
                                     unity::images().entitas_lib, "", "PlayerEntity");
@@ -860,8 +869,19 @@ void draw() {
                                     unity::images().entitas_lib,
                                     "Assets.Sources.Components.Player",
                                     "BasicInfoComponent");
-                                if (bi) s_basic_get_is_dead =
-                                    mono::class_get_method_from_name(bi, "get_IsDead", 0);
+                                if (bi) {
+                                    s_basic_get_is_dead =
+                                        mono::class_get_method_from_name(bi, "get_IsDead", 0);
+                                    if (mono::class_get_field_from_name)
+                                        s_basic_current_field =
+                                            mono::class_get_field_from_name(bi, "Current");
+                                }
+                            }
+                            if (!s_entity_data_get_team && unity::images().contract_lib) {
+                                MonoClass* ped = mono::class_from_name(
+                                    unity::images().contract_lib, "NetData", "PlayerEntityData");
+                                if (ped) s_entity_data_get_team =
+                                    mono::class_get_method_from_name(ped, "get_Team", 0);
                             }
 
                             for (int i = 0; i < cnt && i < 64; i++) {
@@ -885,15 +905,32 @@ void draw() {
                                         continue;
                                 }
 
-                                // Skip dead players via BasicInfoComponent.IsDead
-                                if (s_get_basic_info && s_basic_get_is_dead) {
-                                    MonoObject* basic = mono::runtime_invoke(
+                                // Read BasicInfoComponent for death + team checks
+                                MonoObject* basic = nullptr;
+                                if (s_get_basic_info)
+                                    basic = mono::runtime_invoke(
                                         s_get_basic_info, entity, nullptr, nullptr);
-                                    if (basic) {
-                                        MonoObject* dead_res = mono::runtime_invoke(
-                                            s_basic_get_is_dead, basic, nullptr, nullptr);
-                                        if (dead_res && *static_cast<bool*>(mono::object_unbox(dead_res)))
-                                            continue;
+
+                                // Skip dead players via BasicInfoComponent.IsDead
+                                if (basic && s_basic_get_is_dead) {
+                                    MonoObject* dead_res = mono::runtime_invoke(
+                                        s_basic_get_is_dead, basic, nullptr, nullptr);
+                                    if (dead_res && *static_cast<bool*>(mono::object_unbox(dead_res)))
+                                        continue;
+                                }
+
+                                // Skip teammates (same team_id as local player)
+                                if (basic && s_basic_current_field && s_entity_data_get_team && local_team >= 0) {
+                                    MonoObject* ent_data = nullptr;
+                                    mono::field_get_value(basic, s_basic_current_field, &ent_data);
+                                    if (ent_data) {
+                                        MonoObject* team_res = mono::runtime_invoke(
+                                            s_entity_data_get_team, ent_data, nullptr, nullptr);
+                                        if (team_res) {
+                                            int ent_team = *static_cast<int*>(mono::object_unbox(team_res));
+                                            if (ent_team == local_team)
+                                                continue;
+                                        }
                                     }
                                 }
 

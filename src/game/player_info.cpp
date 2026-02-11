@@ -57,6 +57,7 @@ static struct {
     // PlayerEntityData property getters
     MonoMethod* EntityData_get_Hp     = nullptr;
     MonoMethod* EntityData_get_MaxHp  = nullptr;
+    MonoMethod* EntityData_get_Team   = nullptr;
 
     // FposComponent
     MonoMethod* Fpos_Gp = nullptr;  // Gp() -> Vector3
@@ -244,6 +245,7 @@ bool initialize() {
     if (s_classes.PlayerEntityData) {
         s_methods.EntityData_get_Hp    = mono::class_get_method_from_name(s_classes.PlayerEntityData, "get_Hp", 0);
         s_methods.EntityData_get_MaxHp = mono::class_get_method_from_name(s_classes.PlayerEntityData, "get_MaxHp", 0);
+        s_methods.EntityData_get_Team  = mono::class_get_method_from_name(s_classes.PlayerEntityData, "get_Team", 0);
     }
 
     if (s_classes.FposComponent) {
@@ -323,8 +325,9 @@ static PlayerData read_entity(MonoObject* player_entity) {
         MonoObject* entity_data = nullptr;
         read_field_object(basic_info, s_fields.BasicInfo_Current, entity_data);
         if (entity_data) {
-            data.hp     = unbox_float(invoke(s_methods.EntityData_get_Hp, entity_data));
-            data.max_hp = unbox_float(invoke(s_methods.EntityData_get_MaxHp, entity_data));
+            data.hp      = unbox_float(invoke(s_methods.EntityData_get_Hp, entity_data));
+            data.max_hp  = unbox_float(invoke(s_methods.EntityData_get_MaxHp, entity_data));
+            data.team_id = unbox_int(invoke(s_methods.EntityData_get_Team, entity_data));
         }
     }
 
