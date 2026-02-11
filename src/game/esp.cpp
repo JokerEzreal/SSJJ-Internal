@@ -11,6 +11,7 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <Windows.h>
 
 namespace esp {
 
@@ -83,6 +84,10 @@ struct ScreenPos {
 // Per-frame cached camera to avoid calling Camera.get_main hundreds of times
 static MonoObject* s_frame_camera = nullptr;
 static bool        s_frame_camera_valid = false;
+
+// Stall diagnostics -- track last successful draw tick
+static DWORD s_last_draw_tick = 0;
+static DWORD s_max_gap_ms     = 0;  // longest gap between successful draws
 
 static void refresh_frame_camera() {
     s_frame_camera = nullptr;
@@ -679,12 +684,14 @@ void draw() {
     // Save original GUI color so we can restore it when we are done
     unity::Color orig_color = gui::get_color();
 
-    // ------ Fetch all player data from player_info module ------
+    // ------ Fetch all player data from player_info module (single pass) ------
     std::vector<player_info::PlayerData> players = player_info::read_all_players();
 
-    // Read local player's team_id for teammate filtering
-    player_info::PlayerData local_data = player_info::read_local_player();
-    int local_team = local_data.valid ? local_data.team_id : -1;
+    // Find local player's team_id from the already-fetched list (no extra Mono calls)
+    int local_team = -1;
+    for (const auto& p : players) {
+        if (p.is_local && p.valid) { local_team = p.team_id; break; }
+    }
 
     int w2s_ok = 0, w2s_fail = 0, drawn = 0;
     float first_sx = 0, first_sy = 0;
@@ -805,149 +812,32 @@ void draw() {
     }
 
     // --------------- Skeleton ESP pass ---------------
+    // Reuses the same player data from box ESP (no second entity enumeration).
+    // Filtering (local/dead/teammate) already done by the same criteria.
     int skel_drawn = 0;
     if (s_skeleton_enabled && s_skel.PE_get_thirdPersonUnityObjects) {
-        // Cached Contexts access methods (resolved once)
-        static MonoMethod* s_ctx_shared = nullptr;
-        static MonoMethod* s_ctx_player = nullptr;
-        if (!s_ctx_shared) {
-            MonoClass* ctx_cls = mono::class_from_name(unity::images().entitas_lib, "", "Contexts");
-            if (ctx_cls) {
-                s_ctx_shared = mono::class_get_method_from_name(ctx_cls, "get_sharedInstance", 0);
-                s_ctx_player = mono::class_get_method_from_name(ctx_cls, "get_player", 0);
-            }
-        }
-        MonoObject* contexts = s_ctx_shared ?
-            mono::runtime_invoke(s_ctx_shared, nullptr, nullptr, nullptr) : nullptr;
-        if (contexts) {
-            MonoObject* player_ctx = s_ctx_player ?
-                mono::runtime_invoke(s_ctx_player, contexts, nullptr, nullptr) : nullptr;
-            if (player_ctx) {
-                // Resolve GetEntities dynamically
-                static MonoMethod* s_get_entities = nullptr;
-                if (!s_get_entities && mono::object_get_class && mono::class_get_parent) {
-                    MonoClass* cls = mono::object_get_class(player_ctx);
-                    for (int d = 0; cls && d < 10; d++) {
-                        s_get_entities = mono::class_get_method_from_name(cls, "GetEntities", 0);
-                        if (s_get_entities) break;
-                        cls = mono::class_get_parent(cls);
-                    }
-                }
-                if (s_get_entities) {
-                    MonoObject* entity_list = mono::runtime_invoke(
-                        s_get_entities, player_ctx, nullptr, nullptr);
-                    if (entity_list) {
-                        static MonoMethod* s_get_count = nullptr;
-                        static MonoMethod* s_get_item = nullptr;
-                        if (!s_get_count && mono::object_get_class) {
-                            MonoClass* lcls = mono::object_get_class(entity_list);
-                            if (lcls) {
-                                s_get_count = mono::class_get_method_from_name(lcls, "get_Count", 0);
-                                s_get_item = mono::class_get_method_from_name(lcls, "get_Item", 1);
-                            }
-                        }
-                        if (s_get_count && s_get_item) {
-                            MonoObject* cnt_obj = mono::runtime_invoke(
-                                s_get_count, entity_list, nullptr, nullptr);
-                            int cnt = cnt_obj ? *static_cast<int*>(mono::object_unbox(cnt_obj)) : 0;
+        for (const auto& p : players) {
+            if (!p.valid || p.is_local || p.is_dead) continue;
+            if (local_team >= 0 && p.team_id == local_team) continue;
+            if (!p._raw_entity) continue;
 
-                            static MonoMethod* s_has_comp = nullptr;
-                            static MonoMethod* s_get_basic_info = nullptr;
-                            static MonoMethod* s_basic_get_is_dead = nullptr;
-                            static MonoClassField* s_basic_current_field = nullptr;
-                            static MonoMethod* s_entity_data_get_team = nullptr;
-
-                            // Resolve death-check and team-check methods once
-                            if (!s_get_basic_info) {
-                                MonoClass* pe = mono::class_from_name(
-                                    unity::images().entitas_lib, "", "PlayerEntity");
-                                if (pe) s_get_basic_info =
-                                    mono::class_get_method_from_name(pe, "get_basicInfo", 0);
-                            }
-                            if (!s_basic_get_is_dead) {
-                                MonoClass* bi = mono::class_from_name(
-                                    unity::images().entitas_lib,
-                                    "Assets.Sources.Components.Player",
-                                    "BasicInfoComponent");
-                                if (bi) {
-                                    s_basic_get_is_dead =
-                                        mono::class_get_method_from_name(bi, "get_IsDead", 0);
-                                    if (mono::class_get_field_from_name)
-                                        s_basic_current_field =
-                                            mono::class_get_field_from_name(bi, "Current");
-                                }
-                            }
-                            if (!s_entity_data_get_team && unity::images().contract_lib) {
-                                MonoClass* ped = mono::class_from_name(
-                                    unity::images().contract_lib, "NetData", "PlayerEntityData");
-                                if (ped) s_entity_data_get_team =
-                                    mono::class_get_method_from_name(ped, "get_Team", 0);
-                            }
-
-                            for (int i = 0; i < cnt && i < 64; i++) {
-                                void* idx_args[1] = { &i };
-                                MonoObject* entity = mono::runtime_invoke(
-                                    s_get_item, entity_list, idx_args, nullptr);
-                                if (!entity) continue;
-
-                                // Resolve HasComponent
-                                if (!s_has_comp && mono::object_get_class) {
-                                    MonoClass* ecls = mono::object_get_class(entity);
-                                    if (ecls) s_has_comp = mono::class_get_method_from_name(ecls, "HasComponent", 1);
-                                }
-
-                                // Skip local player (component index 43 = MyPlayer)
-                                if (s_has_comp) {
-                                    int mp_idx = 43;
-                                    void* mp_args[1] = { &mp_idx };
-                                    MonoObject* is_local = mono::runtime_invoke(s_has_comp, entity, mp_args, nullptr);
-                                    if (is_local && *static_cast<bool*>(mono::object_unbox(is_local)))
-                                        continue;
-                                }
-
-                                // Read BasicInfoComponent for death + team checks
-                                MonoObject* basic = nullptr;
-                                if (s_get_basic_info)
-                                    basic = mono::runtime_invoke(
-                                        s_get_basic_info, entity, nullptr, nullptr);
-
-                                // Skip dead players via BasicInfoComponent.IsDead
-                                if (basic && s_basic_get_is_dead) {
-                                    MonoObject* dead_res = mono::runtime_invoke(
-                                        s_basic_get_is_dead, basic, nullptr, nullptr);
-                                    if (dead_res && *static_cast<bool*>(mono::object_unbox(dead_res)))
-                                        continue;
-                                }
-
-                                // Skip teammates (same team_id as local player)
-                                if (basic && s_basic_current_field && s_entity_data_get_team && local_team >= 0) {
-                                    MonoObject* ent_data = nullptr;
-                                    mono::field_get_value(basic, s_basic_current_field, &ent_data);
-                                    if (ent_data) {
-                                        MonoObject* team_res = mono::runtime_invoke(
-                                            s_entity_data_get_team, ent_data, nullptr, nullptr);
-                                        if (team_res) {
-                                            int ent_team = *static_cast<int*>(mono::object_unbox(team_res));
-                                            if (ent_team == local_team)
-                                                continue;
-                                        }
-                                    }
-                                }
-
-                                unity::Color skel_col(0.0f, 1.0f, 0.5f, 1.0f); // green
-                                bool debug_first = (skel_drawn == 0); // dump bone names for first player
-                                if (draw_player_skeleton(entity, screen_w, screen_h, skel_col, debug_first))
-                                    skel_drawn++;
-                            }
-                        }
-                    }
-                }
-            }
+            unity::Color skel_col(0.0f, 1.0f, 0.5f, 1.0f); // green
+            bool debug_first = (skel_drawn == 0);
+            if (draw_player_skeleton(p._raw_entity, screen_w, screen_h, skel_col, debug_first))
+                skel_drawn++;
         }
     }
 
-    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d scr=(%.0f,%.0f)",
-        w2s_ok, w2s_fail, drawn, skel_drawn, first_sx, first_sy);
+    // Track draw gaps for stall diagnosis
+    DWORD now_tick = GetTickCount();
+    if (s_last_draw_tick > 0) {
+        DWORD gap = now_tick - s_last_draw_tick;
+        if (gap > s_max_gap_ms) s_max_gap_ms = gap;
+    }
+    s_last_draw_tick = now_tick;
+
+    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d maxGap=%lums",
+        w2s_ok, w2s_fail, drawn, skel_drawn, s_max_gap_ms);
     s_esp_debug = dbg;
     if (!s_bone_debug.empty()) {
         s_esp_debug += "\nBones:\n";
