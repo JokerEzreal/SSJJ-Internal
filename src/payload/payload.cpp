@@ -5,6 +5,7 @@
 #include "../mono/mono_types.h"
 #include "../menu/menu.h"
 #include "../game/aimbot.h"
+#include "../game/anticheat.h"
 
 #include <cstdio>
 #include <atomic>
@@ -30,6 +31,7 @@ static void __cdecl on_gui_callback()
 static void __cdecl on_update_callback()
 {
     menu::on_update();
+    anticheat::update();
 }
 
 static void __cdecl on_late_update_callback()

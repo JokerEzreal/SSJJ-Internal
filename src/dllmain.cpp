@@ -10,6 +10,7 @@
 #include "game/esp.h"
 #include "game/aimbot.h"
 #include "game/visibility.h"
+#include "game/anticheat.h"
 
 static DWORD WINAPI init_thread(LPVOID param)
 {
@@ -60,6 +61,9 @@ static DWORD WINAPI init_thread(LPVOID param)
     // Step 8c: Initialize visibility (BspTrace raycast)
     visibility::initialize();
 
+    // Step 8d: Initialize anti-cheat bypass
+    anticheat::initialize();
+
     // Step 9: Load and execute C# payload
     if (!payload::initialize()) {
         MessageBoxA(nullptr, "Failed to load payload", "SSJJ-Internal", MB_OK | MB_ICONERROR);
@@ -104,6 +108,7 @@ static DWORD WINAPI init_thread(LPVOID param)
 
     // Cleanup
     payload::shutdown();
+    anticheat::shutdown();
     visibility::shutdown();
     aimbot::shutdown();
     esp::shutdown();

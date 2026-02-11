@@ -5,6 +5,7 @@
 #include "../game/esp.h"
 #include "../game/aimbot.h"
 #include "../game/visibility.h"
+#include "../game/anticheat.h"
 #include "../core/globals.h"
 
 #include <cstdio>
@@ -177,6 +178,10 @@ static void dump_data_to_file() {
 
     f << "=== VISIBILITY DIAGNOSTICS ===\n";
     f << visibility::dump_diagnostics();
+    f << "\n";
+
+    f << "=== ANTI-CHEAT BYPASS DIAGNOSTICS ===\n";
+    f << anticheat::dump_diagnostics();
     f << "\n";
 
     // --- Reference: ECS component indices ---
@@ -438,6 +443,12 @@ void on_gui() {
         const char* vis_dbg = visibility::get_debug_info();
         if (vis_dbg && vis_dbg[0]) {
             gui::label({x, y, w, LINE_H}, fmt("VIS: %s", vis_dbg));
+            y += LINE_H + GAP;
+        }
+
+        const char* ac_dbg = anticheat::get_debug_info();
+        if (ac_dbg && ac_dbg[0]) {
+            gui::label({x, y, w, LINE_H}, fmt("AC: %s", ac_dbg));
             y += LINE_H + GAP;
         }
 
