@@ -120,6 +120,8 @@ struct CachedMethods {
 
     // ---- Object ----
     MonoMethod* Object_get_name           = nullptr;  // UnityEngine.Object.name -> string
+    MonoMethod* Object_DontDestroyOnLoad  = nullptr;  // static DontDestroyOnLoad(Object)
+    MonoMethod* Object_set_hideFlags      = nullptr;  // Object.hideFlags = HideFlags
 };
 
 // Initialize the class/method cache. Returns false if critical classes are missing.

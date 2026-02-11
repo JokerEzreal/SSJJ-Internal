@@ -80,19 +80,30 @@ struct ScreenPos {
     bool visible;
 };
 
+// Per-frame cached camera to avoid calling Camera.get_main hundreds of times
+static MonoObject* s_frame_camera = nullptr;
+static bool        s_frame_camera_valid = false;
+
+static void refresh_frame_camera() {
+    s_frame_camera = nullptr;
+    s_frame_camera_valid = false;
+
+    MonoMethod* get_main = unity::methods().Camera_get_main;
+    if (!get_main) return;
+
+    s_frame_camera = mono::runtime_invoke(get_main, nullptr, nullptr, nullptr);
+    s_frame_camera_valid = true;  // mark as "checked this frame" even if null
+}
+
 static ScreenPos world_to_screen(const unity::Vector3& world_pos, float screen_w, float screen_h) {
     ScreenPos r = { 0, 0, false };
 
-    MonoMethod* get_main = unity::methods().Camera_get_main;
-    MonoMethod* w2s      = unity::methods().Camera_WorldToScreenPoint;
-    if (!get_main || !w2s) return r;
-
-    MonoObject* camera = mono::runtime_invoke(get_main, nullptr, nullptr, nullptr);
-    if (!camera) return r;
+    MonoMethod* w2s = unity::methods().Camera_WorldToScreenPoint;
+    if (!w2s || !s_frame_camera) return r;
 
     unity::Vector3 pos = world_pos;
     void* args[1] = { &pos };
-    MonoObject* result = mono::runtime_invoke(w2s, camera, args, nullptr);
+    MonoObject* result = mono::runtime_invoke(w2s, s_frame_camera, args, nullptr);
     if (!result) return r;
 
     auto* sp = static_cast<unity::Vector3*>(mono::object_unbox(result));
@@ -152,6 +163,21 @@ static void create_texture() {
     void* sp_args[3] = { &px, &py, &white };
     mono::runtime_invoke(tex_sp, s_white_tex, sp_args, nullptr);
     mono::runtime_invoke(tex_ap, s_white_tex, nullptr, nullptr);
+
+    // Protect texture from Unity's resource cleanup:
+    // 1. Set hideFlags = HideAndDontSave (61) to survive scene loads
+    MonoMethod* set_hide = unity::methods().Object_set_hideFlags;
+    if (set_hide) {
+        int flags = 61; // HideFlags.HideAndDontSave
+        void* hide_args[1] = { &flags };
+        mono::runtime_invoke(set_hide, s_white_tex, hide_args, nullptr);
+    }
+    // 2. DontDestroyOnLoad as extra safeguard
+    MonoMethod* ddol = unity::methods().Object_DontDestroyOnLoad;
+    if (ddol) {
+        void* ddol_args[1] = { s_white_tex };
+        mono::runtime_invoke(ddol, nullptr, ddol_args, nullptr);
+    }
 
     // Pin the texture so the GC does not collect it
     s_tex_gc_handle = mono::gchandle_new(s_white_tex, 1);
@@ -630,12 +656,23 @@ void draw() {
     // Initialize skeleton cache on first draw
     init_skeleton_cache();
 
+    // Cache Camera.main once per frame (avoids hundreds of Camera.get_main invokes)
+    refresh_frame_camera();
+
     float screen_w = static_cast<float>(gui::screen_width());
     float screen_h = static_cast<float>(gui::screen_height());
 
     char dbg[1024];
+
+    // If camera is not available (scene transition), skip rendering but don't abort
+    if (!s_frame_camera) {
+        s_esp_debug = "ESP: cam=NULL (scene loading?)";
+        return;
+    }
+
+    // If texture is missing, try again but don't abort — text labels still work
     if (!s_white_tex) {
-        s_esp_debug = "ESP: tex=NULL";
+        s_esp_debug = "ESP: tex=NULL (recreating)";
         return;
     }
 
@@ -644,40 +681,6 @@ void draw() {
 
     // ------ Fetch all player data from player_info module ------
     std::vector<player_info::PlayerData> players = player_info::read_all_players();
-
-    // --- Coordinate diagnostic: test local player W2S with different mappings ---
-    // The correct mapping will project the local player to ~screen center
-    std::string coord_diag;
-    for (const auto& p : players) {
-        if (!p.valid || !p.is_local) continue;
-
-        // Test 1: Raw coords (no conversion)
-        unity::Vector3 raw = p.position;
-        ScreenPos sp_raw = world_to_screen(raw, screen_w, screen_h);
-
-        // Test 2: SsjjToUnity(-y, z, x)
-        unity::Vector3 conv;
-        conv.x = -p.position.y;
-        conv.y =  p.position.z;
-        conv.z =  p.position.x;
-        ScreenPos sp_conv = world_to_screen(conv, screen_w, screen_h);
-
-        // Test 3: (x, z, y) - simple height swap
-        unity::Vector3 swap;
-        swap.x = p.position.x;
-        swap.y = p.position.z;
-        swap.z = p.position.y;
-        ScreenPos sp_swap = world_to_screen(swap, screen_w, screen_h);
-
-        snprintf(dbg, sizeof(dbg),
-            "DIAG pos=(%.0f,%.0f,%.0f) raw_scr=(%.0f,%.0f,%d) conv_scr=(%.0f,%.0f,%d) swap_scr=(%.0f,%.0f,%d)",
-            p.position.x, p.position.y, p.position.z,
-            sp_raw.x, sp_raw.y, sp_raw.visible ? 1 : 0,
-            sp_conv.x, sp_conv.y, sp_conv.visible ? 1 : 0,
-            sp_swap.x, sp_swap.y, sp_swap.visible ? 1 : 0);
-        coord_diag = dbg;
-        break;
-    }
 
     int w2s_ok = 0, w2s_fail = 0, drawn = 0;
     float first_sx = 0, first_sy = 0;
@@ -909,10 +912,6 @@ void draw() {
     snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d scr=(%.0f,%.0f)",
         w2s_ok, w2s_fail, drawn, skel_drawn, first_sx, first_sy);
     s_esp_debug = dbg;
-    if (!coord_diag.empty()) {
-        s_esp_debug += "\n";
-        s_esp_debug += coord_diag;
-    }
     if (!s_bone_debug.empty()) {
         s_esp_debug += "\nBones:\n";
         s_esp_debug += s_bone_debug;

@@ -245,6 +245,8 @@ bool cache_initialize() {
     // ---- Object ----
     if (s_classes.Object) {
         s_methods.Object_get_name = mono::class_get_method_from_name(s_classes.Object, "get_name", 0);
+        s_methods.Object_DontDestroyOnLoad = mono::class_get_method_from_name(s_classes.Object, "DontDestroyOnLoad", 1);
+        s_methods.Object_set_hideFlags = mono::class_get_method_from_name(s_classes.Object, "set_hideFlags", 1);
     }
 
     return true;
