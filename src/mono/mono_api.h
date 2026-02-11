@@ -58,6 +58,9 @@ namespace mono {
     extern mono_string_new_utf16_fn  string_new_utf16;
     extern mono_string_to_utf8_fn    string_to_utf8;
 
+    // Memory
+    extern mono_free_fn              free_mem;
+
     // Internal call
     extern mono_add_internal_call_fn  add_internal_call;
 

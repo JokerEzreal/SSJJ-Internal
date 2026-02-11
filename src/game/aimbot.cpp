@@ -1,5 +1,6 @@
 #include "aimbot.h"
 #include "player_info.h"
+#include "esp.h"
 #include "../mono/mono_api.h"
 #include "../mono/mono_types.h"
 #include "../unity/unity_classes.h"
@@ -288,6 +289,7 @@ static void apply_aimbot() {
     float best_yaw  = 0.0f;
     float best_pitch = 0.0f;
     bool  found = false;
+    bool  used_bone = false;
     std::string target_name;
 
     for (const auto& p : players) {
@@ -299,9 +301,22 @@ static void apply_aimbot() {
             local_data.team_name == p.team_name)
             continue;
 
-        // Target head position
-        unity::Vector3 head = p.position;
-        head.z += HEAD_HEIGHT;
+        // Target head position - prefer actual head bone transform
+        unity::Vector3 head;
+        unity::Vector3 head_unity;
+        bool bone_ok = false;
+        if (p._raw_entity && esp::get_head_bone_world_pos(p._raw_entity, head_unity)) {
+            // Convert Unity world coords -> SSJJ coords
+            // SSJJ(x,y,z) -> Unity(-y, z, x), reverse: Unity(ux,uy,uz) -> SSJJ(uz, -ux, uy)
+            head.x = head_unity.z;
+            head.y = -head_unity.x;
+            head.z = head_unity.y;
+            bone_ok = true;
+        } else {
+            // Fallback to estimated position
+            head = p.position;
+            head.z += HEAD_HEIGHT;
+        }
 
         // Angle from our eye to their head
         float ty, tp;
@@ -315,6 +330,7 @@ static void apply_aimbot() {
             best_yaw    = ty;
             best_pitch  = tp;
             found       = true;
+            used_bone   = bone_ok;
             target_name = p.name;
         }
     }
@@ -342,8 +358,9 @@ static void apply_aimbot() {
     write_orientation(pe, aim_yaw, aim_pitch);
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "AIM: -> %s (%.1f deg) punch=(%.1f,%.1f) src=%s",
+    snprintf(buf, sizeof(buf), "AIM: -> %s (%.1f deg) punch=(%.1f,%.1f) head=%s src=%s",
         target_name.c_str(), best_dist, punch_yaw, punch_pitch,
+        used_bone ? "bone" : "est",
         (input && s_fields.Input_Yaw) ? "input" : "orient");
     s_debug = buf;
 }

@@ -123,6 +123,7 @@ bool cache_initialize() {
     s_classes.Color         = find_class("UnityEngine", "Color",         core_img);
     s_classes.Camera        = find_class("UnityEngine", "Camera",        core_img);
     s_classes.Texture2D     = find_class("UnityEngine", "Texture2D",     core_img);
+    s_classes.Transform     = find_class("UnityEngine", "Transform",     core_img);
 
     // Critical check -- we absolutely need GUI and Screen at minimum
     if (!s_classes.GUI || !s_classes.Screen) {
@@ -221,6 +222,29 @@ bool cache_initialize() {
         s_methods.Texture2D_ctor_2   = mono::class_get_method_from_name(s_classes.Texture2D, ".ctor", 2);
         s_methods.Texture2D_SetPixel = mono::class_get_method_from_name(s_classes.Texture2D, "SetPixel", 3);
         s_methods.Texture2D_Apply_0  = mono::class_get_method_from_name(s_classes.Texture2D, "Apply", 0);
+    }
+
+    // ---- Transform ----
+    if (s_classes.Transform) {
+        s_methods.Transform_get_position   = mono::class_get_method_from_name(s_classes.Transform, "get_position", 0);
+        s_methods.Transform_get_childCount = mono::class_get_method_from_name(s_classes.Transform, "get_childCount", 0);
+        s_methods.Transform_GetChild       = mono::class_get_method_from_name(s_classes.Transform, "GetChild", 1);
+        s_methods.Transform_get_parent     = mono::class_get_method_from_name(s_classes.Transform, "get_parent", 0);
+    }
+
+    // ---- GameObject ----
+    if (s_classes.GameObject) {
+        s_methods.GameObject_get_transform = mono::class_get_method_from_name(s_classes.GameObject, "get_transform", 0);
+    }
+
+    // ---- GUIUtility (additional) ----
+    if (s_classes.GUIUtility) {
+        s_methods.GUIUtility_RotateAroundPivot = mono::class_get_method_from_name(s_classes.GUIUtility, "RotateAroundPivot", 2);
+    }
+
+    // ---- Object ----
+    if (s_classes.Object) {
+        s_methods.Object_get_name = mono::class_get_method_from_name(s_classes.Object, "get_name", 0);
     }
 
     return true;

@@ -54,6 +54,9 @@ namespace mono {
     mono_string_new_utf16_fn  string_new_utf16 = nullptr;
     mono_string_to_utf8_fn    string_to_utf8   = nullptr;
 
+    // Memory
+    mono_free_fn              free_mem         = nullptr;
+
     // Internal call
     mono_add_internal_call_fn  add_internal_call = nullptr;
 
@@ -144,6 +147,7 @@ namespace mono {
         resolve(s_mono_module, "mono_string_new",                  string_new);
         resolve(s_mono_module, "mono_string_new_utf16",            string_new_utf16);
         resolve(s_mono_module, "mono_string_to_utf8",              string_to_utf8);
+        resolve(s_mono_module, "mono_free",                        free_mem);
 
         resolve(s_mono_module, "mono_add_internal_call",           add_internal_call);
 

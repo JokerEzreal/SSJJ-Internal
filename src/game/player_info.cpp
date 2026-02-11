@@ -432,6 +432,7 @@ PlayerData read_local_player() {
     MonoObject* player_entity = invoke(s_methods.PlayerContext_get_myPlayerEntity, player_ctx);
     PlayerData data = read_entity(player_entity);
     data.is_local = true;
+    data._raw_entity = player_entity;
     return data;
 }
 
@@ -544,6 +545,7 @@ std::vector<PlayerData> read_all_players() {
         }
 
         PlayerData data = read_entity(entity);
+        data._raw_entity = entity;
 
         // Check if this is local player
         if (s_entity_has_comp) {

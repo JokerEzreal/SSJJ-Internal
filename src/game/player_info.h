@@ -4,11 +4,18 @@
 #include <string>
 #include <vector>
 
+// Forward declaration
+struct _MonoObject;
+typedef struct _MonoObject MonoObject;
+
 namespace player_info {
 
 struct PlayerData {
     bool valid = false;
     bool is_local = false;
+
+    // Raw entity pointer (valid only within the current frame, do NOT cache)
+    MonoObject* _raw_entity = nullptr;
 
     // Identity
     std::string name;

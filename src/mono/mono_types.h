@@ -85,6 +85,9 @@ typedef MonoString* (*mono_string_new_fn)(MonoDomain* domain, const char* text);
 typedef MonoString* (*mono_string_new_utf16_fn)(MonoDomain* domain, const mono_unichar2* text, int32_t len);
 typedef char*       (*mono_string_to_utf8_fn)(MonoString* string_obj);
 
+// Memory
+typedef void (*mono_free_fn)(void* ptr);
+
 // Internal call registration
 typedef void (*mono_add_internal_call_fn)(const char* name, const void* method);
 

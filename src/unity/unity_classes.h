@@ -32,6 +32,7 @@ struct CachedClasses {
     MonoClass* Color          = nullptr;
     MonoClass* Camera         = nullptr;
     MonoClass* Texture2D      = nullptr;
+    MonoClass* Transform      = nullptr;
 };
 
 // Cached MonoMethod* handles for frequently-used Unity methods
@@ -104,6 +105,21 @@ struct CachedMethods {
     MonoMethod* Texture2D_ctor_2          = nullptr;  // new Texture2D(int, int)
     MonoMethod* Texture2D_SetPixel        = nullptr;  // SetPixel(int, int, Color)
     MonoMethod* Texture2D_Apply_0         = nullptr;  // Apply()
+
+    // ---- Transform ----
+    MonoMethod* Transform_get_position    = nullptr;  // Transform.position -> Vector3
+    MonoMethod* Transform_get_childCount  = nullptr;  // Transform.childCount -> int
+    MonoMethod* Transform_GetChild        = nullptr;  // Transform.GetChild(int) -> Transform
+    MonoMethod* Transform_get_parent      = nullptr;  // Transform.parent -> Transform
+
+    // ---- GameObject ----
+    MonoMethod* GameObject_get_transform  = nullptr;  // GameObject.transform -> Transform
+
+    // ---- GUIUtility ----
+    MonoMethod* GUIUtility_RotateAroundPivot = nullptr;  // RotateAroundPivot(float, Vector2)
+
+    // ---- Object ----
+    MonoMethod* Object_get_name           = nullptr;  // UnityEngine.Object.name -> string
 };
 
 // Initialize the class/method cache. Returns false if critical classes are missing.
