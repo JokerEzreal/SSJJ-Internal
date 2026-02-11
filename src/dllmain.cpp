@@ -64,12 +64,37 @@ static DWORD WINAPI init_thread(LPVOID param)
 
     globals::initialized = true;
 
-    // Keep thread alive, wait for unload signal
+    // Keep thread alive, wait for unload signal.
+    // Also monitor heartbeat -- if C# callbacks stop for too long,
+    // re-inject the MonoBehaviour overlay.
+    uint64_t last_heartbeat      = payload::get_heartbeat();
+    DWORD    last_heartbeat_tick  = GetTickCount();
+    constexpr DWORD HEARTBEAT_TIMEOUT_MS = 8000; // 8 seconds of silence => reinject
+
     while (globals::running) {
         // Press END key to unload
         if (GetAsyncKeyState(VK_END) & 1) {
             globals::running = false;
         }
+
+        // Watchdog: check if heartbeat is advancing
+        uint64_t hb = payload::get_heartbeat();
+        if (hb != last_heartbeat) {
+            last_heartbeat     = hb;
+            last_heartbeat_tick = GetTickCount();
+        } else {
+            DWORD elapsed = GetTickCount() - last_heartbeat_tick;
+            if (elapsed > HEARTBEAT_TIMEOUT_MS && last_heartbeat > 0) {
+                printf("[watchdog] heartbeat stalled for %lu ms -- re-injecting overlay\n",
+                       elapsed);
+                payload::reinject();
+                last_heartbeat_tick = GetTickCount();
+                // Give it a moment to come alive
+                Sleep(500);
+                last_heartbeat = payload::get_heartbeat();
+            }
+        }
+
         Sleep(100);
     }
 

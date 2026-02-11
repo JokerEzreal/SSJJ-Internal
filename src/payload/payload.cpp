@@ -7,6 +7,15 @@
 #include "../game/aimbot.h"
 
 #include <cstdio>
+#include <atomic>
+
+// ---------------------------------------------------------------------------
+// Heartbeat counter -- proves that C# callbacks are running.
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> s_heartbeat{0};
+
+// Cached handles for re-injection
+static MonoMethod* s_loader_init = nullptr;
 
 // ---------------------------------------------------------------------------
 // C++ callbacks invoked from C# via Mono internal calls.
@@ -14,6 +23,7 @@
 
 static void __cdecl on_gui_callback()
 {
+    s_heartbeat.fetch_add(1, std::memory_order_relaxed);
     menu::on_gui();
 }
 
@@ -117,6 +127,9 @@ bool initialize()
         return false;
     }
 
+    // Cache for re-injection
+    s_loader_init = init_method;
+
     MonoObject* exception = nullptr;
     mono::runtime_invoke(init_method, nullptr, nullptr, &exception);
 
@@ -130,14 +143,55 @@ bool initialize()
 }
 
 // ---------------------------------------------------------------------------
+// payload::get_heartbeat
+// ---------------------------------------------------------------------------
+
+uint64_t get_heartbeat()
+{
+    return s_heartbeat.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// payload::reinject
+//
+// Re-invoke Payload.Loader.Init() to create a new MonoBehaviour overlay.
+// This is safe because Init() creates a fresh GameObject each time.
+// The old (destroyed) one is already gone by the time we call this.
+// ---------------------------------------------------------------------------
+
+bool reinject()
+{
+    if (!s_loader_init) {
+        printf("[payload] reinject: no cached Init method\n");
+        return false;
+    }
+
+    // Make sure we're attached to the Mono domain
+    MonoDomain* domain = mono::get_root_domain();
+    if (domain) {
+        mono::thread_attach(domain);
+    }
+
+    MonoObject* exception = nullptr;
+    mono::runtime_invoke(s_loader_init, nullptr, nullptr, &exception);
+
+    if (exception) {
+        printf("[payload] reinject: Loader.Init() threw an exception\n");
+        return false;
+    }
+
+    printf("[payload] reinject: successfully re-created overlay\n");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // payload::shutdown
 // ---------------------------------------------------------------------------
 
 void shutdown()
 {
-    // The OverlayBehaviour will be destroyed when Unity unloads, or we could
-    // explicitly search for the "__SSJJ_Overlay__" GameObject and destroy it
-    // here if a clean detach is needed.
+    s_loader_init = nullptr;
+    s_heartbeat.store(0, std::memory_order_relaxed);
 }
 
 } // namespace payload

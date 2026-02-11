@@ -28,8 +28,15 @@ namespace Payload
         public static void Init()
         {
             GameObject go = new GameObject("__SSJJ_Overlay__");
+            // HideAndDontSave (61) = HideInHierarchy | DontSaveInEditor |
+            // NotEditable | DontSaveInBuild | DontUnloadUnusedAsset.
+            // This prevents game code from finding/destroying us via
+            // GameObject.Find or FindObjectOfType, and also prevents
+            // Unity from unloading us during scene transitions.
+            go.hideFlags = HideFlags.HideAndDontSave;
             Object.DontDestroyOnLoad(go);
-            go.AddComponent<OverlayBehaviour>();
+            var comp = go.AddComponent<OverlayBehaviour>();
+            comp.hideFlags = HideFlags.HideAndDontSave;
         }
     }
 
