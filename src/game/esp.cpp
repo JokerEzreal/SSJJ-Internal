@@ -51,6 +51,18 @@ static const char* fmt(const char* format, ...) {
     return buf;
 }
 
+// Exception-safe mono invoke.  Catches managed exceptions locally instead of
+// letting them propagate through the C++ stack (which would abort the entire
+// OnGUI callback and kill all drawing for the frame).
+static MonoObject* invoke_safe(MonoMethod* method, MonoObject* obj,
+                               void** params = nullptr)
+{
+    if (!method) return nullptr;
+    MonoObject* exc = nullptr;
+    MonoObject* ret = mono::runtime_invoke(method, obj, params, &exc);
+    return exc ? nullptr : ret;
+}
+
 // ---------------------------------------------------------------------------
 // Drawing primitives (require s_white_tex)
 // ---------------------------------------------------------------------------
@@ -97,7 +109,7 @@ static void refresh_frame_camera() {
     MonoMethod* get_main = unity::methods().Camera_get_main;
     if (!get_main) return;
 
-    s_frame_camera = mono::runtime_invoke(get_main, nullptr, nullptr, nullptr);
+    s_frame_camera = invoke_safe(get_main, nullptr);
     s_frame_camera_valid = true;  // mark as "checked this frame" even if null
 }
 
@@ -109,7 +121,7 @@ static ScreenPos world_to_screen(const unity::Vector3& world_pos, float screen_w
 
     unity::Vector3 pos = world_pos;
     void* args[1] = { &pos };
-    MonoObject* result = mono::runtime_invoke(w2s, s_frame_camera, args, nullptr);
+    MonoObject* result = invoke_safe(w2s, s_frame_camera, args);
     if (!result) return r;
 
     auto* sp = static_cast<unity::Vector3*>(mono::object_unbox(result));
@@ -162,13 +174,13 @@ static void create_texture() {
 
     int tw = 1, th = 1;
     void* ctor_args[2] = { &tw, &th };
-    mono::runtime_invoke(tex_ctor, s_white_tex, ctor_args, nullptr);
+    invoke_safe(tex_ctor, s_white_tex, ctor_args);
 
     int px = 0, py = 0;
     unity::Color white = unity::Color::white();
     void* sp_args[3] = { &px, &py, &white };
-    mono::runtime_invoke(tex_sp, s_white_tex, sp_args, nullptr);
-    mono::runtime_invoke(tex_ap, s_white_tex, nullptr, nullptr);
+    invoke_safe(tex_sp, s_white_tex, sp_args);
+    invoke_safe(tex_ap, s_white_tex);
 
     // Protect texture from Unity's resource cleanup:
     // 1. Set hideFlags = HideAndDontSave (61) to survive scene loads
@@ -176,13 +188,13 @@ static void create_texture() {
     if (set_hide) {
         int flags = 61; // HideFlags.HideAndDontSave
         void* hide_args[1] = { &flags };
-        mono::runtime_invoke(set_hide, s_white_tex, hide_args, nullptr);
+        invoke_safe(set_hide, s_white_tex, hide_args);
     }
     // 2. DontDestroyOnLoad as extra safeguard
     MonoMethod* ddol = unity::methods().Object_DontDestroyOnLoad;
     if (ddol) {
         void* ddol_args[1] = { s_white_tex };
-        mono::runtime_invoke(ddol, nullptr, ddol_args, nullptr);
+        invoke_safe(ddol, nullptr, ddol_args);
     }
 
     // Pin the texture so the GC does not collect it
@@ -230,17 +242,17 @@ static void draw_line(float x1, float y1, float x2, float y2,
 
     // Rotate GUI matrix
     void* rot_args[2] = { &angle, &pivot };
-    mono::runtime_invoke(rotate, nullptr, rot_args, nullptr);
+    invoke_safe(rotate, nullptr, rot_args);
 
     // Draw thin rect
     gui::set_color(col);
     gui::draw_texture(unity::Rect(x1, y1 - thickness * 0.5f, length, thickness),
                       s_white_tex);
 
-    // Restore GUI matrix
+    // Restore GUI matrix (MUST always run, even if draw failed)
     float neg = -angle;
     void* restore_args[2] = { &neg, &pivot };
-    mono::runtime_invoke(rotate, nullptr, restore_args, nullptr);
+    invoke_safe(rotate, nullptr, restore_args);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +288,7 @@ static bool get_transform_position(MonoObject* transform, unity::Vector3& out) {
     MonoMethod* get_pos = unity::methods().Transform_get_position;
     if (!get_pos) return false;
 
-    MonoObject* result = mono::runtime_invoke(get_pos, transform, nullptr, nullptr);
+    MonoObject* result = invoke_safe(get_pos, transform);
     if (!result) return false;
 
     auto* v = static_cast<unity::Vector3*>(mono::object_unbox(result));
@@ -290,7 +302,7 @@ static int get_child_count(MonoObject* transform) {
     if (!transform) return 0;
     MonoMethod* m = unity::methods().Transform_get_childCount;
     if (!m) return 0;
-    MonoObject* result = mono::runtime_invoke(m, transform, nullptr, nullptr);
+    MonoObject* result = invoke_safe(m, transform);
     if (!result) return 0;
     return *static_cast<int*>(mono::object_unbox(result));
 }
@@ -301,7 +313,7 @@ static MonoObject* get_child(MonoObject* transform, int index) {
     MonoMethod* m = unity::methods().Transform_GetChild;
     if (!m) return nullptr;
     void* args[1] = { &index };
-    return mono::runtime_invoke(m, transform, args, nullptr);
+    return invoke_safe(m, transform, args);
 }
 
 // Get parent Transform
@@ -309,7 +321,7 @@ static MonoObject* get_parent(MonoObject* transform) {
     if (!transform) return nullptr;
     MonoMethod* m = unity::methods().Transform_get_parent;
     if (!m) return nullptr;
-    return mono::runtime_invoke(m, transform, nullptr, nullptr);
+    return invoke_safe(m, transform);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +349,7 @@ static std::string get_transform_name(MonoObject* transform) {
     if (!transform) return "";
     MonoMethod* get_name = unity::methods().Object_get_name;
     if (!get_name) return "";
-    MonoObject* name_obj = mono::runtime_invoke(get_name, transform, nullptr, nullptr);
+    MonoObject* name_obj = invoke_safe(get_name, transform);
     if (!name_obj) return "";
     char* utf8 = mono::string_to_utf8(reinterpret_cast<MonoString*>(name_obj));
     if (!utf8) return "";
@@ -471,14 +483,14 @@ static bool draw_player_skeleton(MonoObject* player_entity,
         !s_skel.PE_get_thirdPersonUnityObjects) return false;
 
     // Check hasThirdPersonUnityObjects
-    MonoObject* has_res = mono::runtime_invoke(
-        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* has_res = invoke_safe(
+        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity);
     if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
         return false;
 
     // Get ThirdPersonUnityObjectsComponent
-    MonoObject* tpu = mono::runtime_invoke(
-        s_skel.PE_get_thirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* tpu = invoke_safe(
+        s_skel.PE_get_thirdPersonUnityObjects, player_entity);
     if (!tpu) return false;
 
     // Read ThirdTran field
@@ -506,7 +518,7 @@ static bool draw_player_skeleton(MonoObject* player_entity,
 
     MonoMethod* get_tf = unity::methods().GameObject_get_transform;
     if (!get_tf) return false;
-    MonoObject* root_transform = mono::runtime_invoke(get_tf, root_go, nullptr, nullptr);
+    MonoObject* root_transform = invoke_safe(get_tf, root_go);
     if (!root_transform) return false;
 
     // Debug dump: collect all bone names (only for first player, once)
@@ -638,14 +650,14 @@ bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
         !s_skel.PE_get_thirdPersonUnityObjects) return false;
 
     // Check hasThirdPersonUnityObjects
-    MonoObject* has_res = mono::runtime_invoke(
-        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* has_res = invoke_safe(
+        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity);
     if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
         return false;
 
     // Get ThirdPersonUnityObjectsComponent
-    MonoObject* tpu = mono::runtime_invoke(
-        s_skel.PE_get_thirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* tpu = invoke_safe(
+        s_skel.PE_get_thirdPersonUnityObjects, player_entity);
     if (!tpu || !s_skel.TPU_ThirdTran) return false;
 
     // Get ThirdTran
@@ -687,13 +699,13 @@ int get_bone_targets(MonoObject* player_entity,
         !s_skel.PE_get_thirdPersonUnityObjects) return 0;
 
     // Check hasThirdPersonUnityObjects
-    MonoObject* has_res = mono::runtime_invoke(
-        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* has_res = invoke_safe(
+        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity);
     if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
         return 0;
 
-    MonoObject* tpu = mono::runtime_invoke(
-        s_skel.PE_get_thirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    MonoObject* tpu = invoke_safe(
+        s_skel.PE_get_thirdPersonUnityObjects, player_entity);
     if (!tpu || !s_skel.TPU_ThirdTran) return 0;
 
     MonoObject* third_tran = nullptr;
@@ -718,7 +730,7 @@ int get_bone_targets(MonoObject* player_entity,
 
     MonoMethod* get_tf = unity::methods().GameObject_get_transform;
     if (!get_tf) return 0;
-    MonoObject* root_transform = mono::runtime_invoke(get_tf, root_go, nullptr, nullptr);
+    MonoObject* root_transform = invoke_safe(get_tf, root_go);
     if (!root_transform) return 0;
 
     // Collect bones
@@ -747,8 +759,15 @@ int get_bone_targets(MonoObject* player_entity,
     return count;
 }
 
+// Frame counter for stale detection in debug display
+static uint32_t s_esp_frame = 0;
+
 void draw() {
     if (!s_enabled) return;
+
+    // Increment frame counter and mark debug as "in progress" so that if we
+    // throw an exception, the stale string will be obviously different.
+    s_esp_frame++;
 
     // Create texture on first draw (main thread context)
     ensure_texture();
@@ -956,8 +975,8 @@ void draw() {
     }
     s_last_draw_tick = now_tick;
 
-    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d maxGap=%lums",
-        w2s_ok, w2s_fail, drawn, skel_drawn, s_max_gap_ms);
+    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d gap=%lums #%u",
+        w2s_ok, w2s_fail, drawn, skel_drawn, s_max_gap_ms, s_esp_frame);
     s_esp_debug = dbg;
     if (!s_bone_debug.empty()) {
         s_esp_debug += "\nBones:\n";

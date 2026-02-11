@@ -14,6 +14,7 @@ struct CachedImages {
     MonoImage* contract_lib    = nullptr;  // SSJJ.Contract (network data)
     MonoImage* physics_lib     = nullptr;  // SSJJPhysics_Library (BSP physics)
     MonoImage* physics_net     = nullptr;  // physics.net (trace types)
+    MonoImage* base_lib        = nullptr;  // SSJJBase_Library (utilities)
 };
 
 // Cached MonoClass* handles for Unity engine classes

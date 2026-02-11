@@ -94,6 +94,9 @@ bool cache_initialize() {
         else if (strcmp(name, "physics.net") == 0) {
             s_images.physics_net = img;
         }
+        else if (strcmp(name, "SSJJBase_Library") == 0) {
+            s_images.base_lib = img;
+        }
     }
 
     // If we never found dedicated modules, fall back to main engine image

@@ -4,6 +4,7 @@
 #include "../mono/mono_api.h"
 #include "../mono/mono_types.h"
 #include "../menu/menu.h"
+#include "../game/esp.h"
 #include "../game/aimbot.h"
 #include "../game/anticheat.h"
 
@@ -20,20 +21,38 @@ static MonoMethod* s_loader_init = nullptr;
 
 // ---------------------------------------------------------------------------
 // C++ callbacks invoked from C# via Mono internal calls.
+//
+// IMPORTANT: Each callback is wrapped in its own C# try-catch on the managed
+// side.  This means an unhandled managed exception in one callback does NOT
+// prevent the other callbacks from executing in the same frame.
 // ---------------------------------------------------------------------------
 
-static void __cdecl on_gui_callback()
+// Called from C# OnGUI — first try-catch block (drawing world overlays)
+static void __cdecl on_draw_esp()
 {
     s_heartbeat.fetch_add(1, std::memory_order_relaxed);
-    menu::on_gui();
+    esp::draw();
 }
 
+// Called from C# OnGUI — second try-catch block (menu window)
+static void __cdecl on_draw_menu()
+{
+    menu::on_gui_menu();
+}
+
+// Called from C# Update — first try-catch block
 static void __cdecl on_update_callback()
 {
     menu::on_update();
+}
+
+// Called from C# Update — second try-catch block
+static void __cdecl on_anticheat_callback()
+{
     anticheat::update();
 }
 
+// Called from C# LateUpdate
 static void __cdecl on_late_update_callback()
 {
     // Aimbot runs in LateUpdate so it writes orientation AFTER the game's
@@ -54,12 +73,16 @@ namespace payload {
 bool initialize()
 {
     // -----------------------------------------------------------------------
-    // Step 1 -- Register internal calls
+    // Step 1 -- Register internal calls (must match C# Bridge method names)
     // -----------------------------------------------------------------------
-    mono::add_internal_call("Payload.Bridge::OnGUICallback",
-                            reinterpret_cast<const void*>(on_gui_callback));
+    mono::add_internal_call("Payload.Bridge::OnDrawESP",
+                            reinterpret_cast<const void*>(on_draw_esp));
+    mono::add_internal_call("Payload.Bridge::OnDrawMenu",
+                            reinterpret_cast<const void*>(on_draw_menu));
     mono::add_internal_call("Payload.Bridge::OnUpdateCallback",
                             reinterpret_cast<const void*>(on_update_callback));
+    mono::add_internal_call("Payload.Bridge::OnAntiCheatCallback",
+                            reinterpret_cast<const void*>(on_anticheat_callback));
     mono::add_internal_call("Payload.Bridge::OnLateUpdateCallback",
                             reinterpret_cast<const void*>(on_late_update_callback));
 

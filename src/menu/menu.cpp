@@ -249,9 +249,9 @@ void on_update() {
     }
 }
 
-void on_gui() {
-    // Always draw ESP regardless of menu visibility
-    esp::draw();
+void on_gui_menu() {
+    // ESP is now drawn in a separate C# try-catch callback (on_draw_esp)
+    // so that exceptions during scene transitions don't prevent menu drawing.
 
     if (!s_visible) return;
 
@@ -335,11 +335,13 @@ void on_gui() {
 
         // Dump data button
         if (gui::button({x, y, w, BTN_H}, "Dump Data to File (AI Analysis)")) {
-            // Request fresh bone dump then write file
+            // Request fresh bone dump then write file.
+            // NOTE: We use the already-cached player data (refreshed every 15
+            // frames in on_update) instead of calling read_local_player /
+            // read_all_players here, because those make Mono calls that can
+            // throw managed exceptions during scene transitions and abort the
+            // entire on_gui_menu callback.
             esp::request_bone_dump();
-            // Force immediate data refresh
-            s_local_player = player_info::read_local_player();
-            s_all_players  = player_info::read_all_players();
             dump_data_to_file();
         }
         y += BTN_H + GAP;

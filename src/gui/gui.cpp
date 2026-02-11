@@ -7,6 +7,18 @@
 namespace gui {
 
 // ---------------------------------------------------------------------------
+// Exception-safe invoke: catches managed exceptions locally so they don't
+// longjmp past C++ stack frames (which would skip destructors in callers).
+// ---------------------------------------------------------------------------
+static MonoObject* invoke_safe(MonoMethod* method, MonoObject* obj = nullptr,
+                               void** params = nullptr) {
+    if (!method) return nullptr;
+    MonoObject* exc = nullptr;
+    MonoObject* ret = mono::runtime_invoke(method, obj, params, &exc);
+    return exc ? nullptr : ret;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: create a managed System.String from a C string.
 // ---------------------------------------------------------------------------
 static MonoString* make_string(const char* text) {
@@ -59,7 +71,7 @@ void label(const unity::Rect& pos, const char* text) {
     unity::Rect r = pos;
     MonoString* str = make_string(text);
     void* args[2] = { &r, str };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 void box(const unity::Rect& pos, const char* text) {
@@ -69,7 +81,7 @@ void box(const unity::Rect& pos, const char* text) {
     unity::Rect r = pos;
     MonoString* str = make_string(text);
     void* args[2] = { &r, str };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 bool button(const unity::Rect& pos, const char* text) {
@@ -79,7 +91,7 @@ bool button(const unity::Rect& pos, const char* text) {
     unity::Rect r = pos;
     MonoString* str = make_string(text);
     void* args[2] = { &r, str };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -91,7 +103,7 @@ bool toggle(const unity::Rect& pos, bool value, const char* text) {
     mono_bool    val = value ? 1 : 0;   // Mono bool is int32
     MonoString*  str = make_string(text);
     void* args[3] = { &r, &val, str };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -108,7 +120,7 @@ float horizontal_slider(const unity::Rect& pos, float value, float left, float r
     float       lv  = left;
     float       rv  = right;
     void* args[5] = { &r, &v, &lv, &rv, nullptr };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_float(result);
 }
 
@@ -119,7 +131,7 @@ std::string text_field(const unity::Rect& pos, const char* text) {
     unity::Rect r   = pos;
     MonoString* str = make_string(text);
     void* args[2] = { &r, str };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
 
     if (!result) return text ? text : "";
 
@@ -141,7 +153,7 @@ void drag_window() {
     MonoMethod* method = unity::methods().GUI_DragWindow_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void set_color(const unity::Color& color) {
@@ -150,14 +162,14 @@ void set_color(const unity::Color& color) {
 
     unity::Color c = color;
     void* args[1] = { &c };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 unity::Color get_color() {
     MonoMethod* method = unity::methods().GUI_get_color;
     if (!method) return unity::Color::white();
 
-    MonoObject* result = mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    MonoObject* result = invoke_safe(method);
     if (!result) return unity::Color::white();
     return *static_cast<unity::Color*>(mono::object_unbox(result));
 }
@@ -168,7 +180,7 @@ void draw_texture(const unity::Rect& pos, MonoObject* texture) {
 
     unity::Rect r = pos;
     void* args[2] = { &r, texture };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 // ===========================================================================
@@ -180,9 +192,9 @@ static MonoObject* get_label_style() {
     MonoMethod* get_label = unity::methods().GUISkin_get_label;
     if (!get_skin || !get_label) return nullptr;
 
-    MonoObject* skin = mono::runtime_invoke(get_skin, nullptr, nullptr, nullptr);
+    MonoObject* skin = invoke_safe(get_skin);
     if (!skin) return nullptr;
-    return mono::runtime_invoke(get_label, skin, nullptr, nullptr);
+    return invoke_safe(get_label, skin);
 }
 
 void set_label_font_size(int size) {
@@ -190,14 +202,14 @@ void set_label_font_size(int size) {
     MonoMethod* setter = unity::methods().GUIStyle_set_fontSize;
     if (!style || !setter) return;
     void* args[1] = { &size };
-    mono::runtime_invoke(setter, style, args, nullptr);
+    invoke_safe(setter, style, args);
 }
 
 int get_label_font_size() {
     MonoObject* style = get_label_style();
     MonoMethod* getter = unity::methods().GUIStyle_get_fontSize;
     if (!style || !getter) return 0;
-    MonoObject* result = mono::runtime_invoke(getter, style, nullptr, nullptr);
+    MonoObject* result = invoke_safe(getter, style);
     return unbox_int(result);
 }
 
@@ -206,14 +218,14 @@ void set_label_alignment(int alignment) {
     MonoMethod* setter = unity::methods().GUIStyle_set_alignment;
     if (!style || !setter) return;
     void* args[1] = { &alignment };
-    mono::runtime_invoke(setter, style, args, nullptr);
+    invoke_safe(setter, style, args);
 }
 
 int get_label_alignment() {
     MonoObject* style = get_label_style();
     MonoMethod* getter = unity::methods().GUIStyle_get_alignment;
     if (!style || !getter) return 0;
-    MonoObject* result = mono::runtime_invoke(getter, style, nullptr, nullptr);
+    MonoObject* result = invoke_safe(getter, style);
     return unbox_int(result);
 }
 
@@ -229,7 +241,7 @@ void label(const char* text) {
 
     MonoString* str = make_string(text);
     void* args[1] = { str };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 bool button(const char* text) {
@@ -238,7 +250,7 @@ bool button(const char* text) {
 
     MonoString* str = make_string(text);
     void* args[1] = { str };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -249,7 +261,7 @@ bool toggle(bool value, const char* text) {
     mono_bool   val = value ? 1 : 0;
     MonoString* str = make_string(text);
     void* args[2] = { &val, str };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -257,28 +269,28 @@ void begin_vertical() {
     MonoMethod* method = unity::methods().GUILayout_BeginVertical_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void end_vertical() {
     MonoMethod* method = unity::methods().GUILayout_EndVertical_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void begin_horizontal() {
     MonoMethod* method = unity::methods().GUILayout_BeginHorizontal_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void end_horizontal() {
     MonoMethod* method = unity::methods().GUILayout_EndHorizontal_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void begin_area(const unity::Rect& rect) {
@@ -287,14 +299,14 @@ void begin_area(const unity::Rect& rect) {
 
     unity::Rect r = rect;
     void* args[1] = { &r };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 void end_area() {
     MonoMethod* method = unity::methods().GUILayout_EndArea_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 void space(float pixels) {
@@ -303,14 +315,14 @@ void space(float pixels) {
 
     float px = pixels;
     void* args[1] = { &px };
-    mono::runtime_invoke(method, nullptr, args, nullptr);
+    invoke_safe(method, nullptr, args);
 }
 
 void flexible_space() {
     MonoMethod* method = unity::methods().GUILayout_FlexibleSpace_0;
     if (!method) return;
 
-    mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    invoke_safe(method);
 }
 
 } // namespace layout
@@ -323,7 +335,7 @@ int screen_width() {
     MonoMethod* method = unity::methods().Screen_get_width;
     if (!method) return 1920;  // sensible fallback
 
-    MonoObject* result = mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    MonoObject* result = invoke_safe(method);
     return unbox_int(result);
 }
 
@@ -331,7 +343,7 @@ int screen_height() {
     MonoMethod* method = unity::methods().Screen_get_height;
     if (!method) return 1080;  // sensible fallback
 
-    MonoObject* result = mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    MonoObject* result = invoke_safe(method);
     return unbox_int(result);
 }
 
@@ -345,7 +357,7 @@ bool get_key_down(int keycode) {
 
     int kc = keycode;
     void* args[1] = { &kc };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -355,7 +367,7 @@ bool get_key(int keycode) {
 
     int kc = keycode;
     void* args[1] = { &kc };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -365,7 +377,7 @@ bool get_mouse_button(int button) {
 
     int btn = button;
     void* args[1] = { &btn };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -375,7 +387,7 @@ bool get_mouse_button_down(int button) {
 
     int btn = button;
     void* args[1] = { &btn };
-    MonoObject* result = mono::runtime_invoke(method, nullptr, args, nullptr);
+    MonoObject* result = invoke_safe(method, nullptr, args);
     return unbox_bool(result);
 }
 
@@ -383,7 +395,7 @@ unity::Vector2 get_mouse_position_gui() {
     MonoMethod* method = unity::methods().Input_get_mousePosition;
     if (!method) return { 0.0f, 0.0f };
 
-    MonoObject* result = mono::runtime_invoke(method, nullptr, nullptr, nullptr);
+    MonoObject* result = invoke_safe(method);
     if (!result) return { 0.0f, 0.0f };
 
     // Input.mousePosition returns Vector3; Y is inverted relative to GUI coords.

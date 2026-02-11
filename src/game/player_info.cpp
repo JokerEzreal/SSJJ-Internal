@@ -120,9 +120,15 @@ static std::string s_debug_info;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static MonoObject* invoke(MonoMethod* method, MonoObject* obj) {
+// Exception-safe invoke: catches managed exceptions locally so they don't
+// longjmp past C++ stack frames (which would skip destructors of std::string,
+// std::vector etc. and corrupt the heap).
+static MonoObject* invoke(MonoMethod* method, MonoObject* obj,
+                          void** params = nullptr) {
     if (!method) return nullptr;
-    return mono::runtime_invoke(method, obj, nullptr, nullptr);
+    MonoObject* exc = nullptr;
+    MonoObject* ret = mono::runtime_invoke(method, obj, params, &exc);
+    return exc ? nullptr : ret;
 }
 
 static bool unbox_bool(MonoObject* obj) {
@@ -400,8 +406,8 @@ static PlayerData read_entity(MonoObject* player_entity) {
             if (s_methods.Change_GetPosIndex) {
                 int pos_index = unbox_int(invoke(s_methods.Change_GetPosIndex, change_obj));
                 void* args[1] = { &pos_index };
-                MonoObject* pos_result = mono::runtime_invoke(
-                    s_methods.PlayerEntity_GetCompenstatePos, player_entity, args, nullptr);
+                MonoObject* pos_result = invoke(
+                    s_methods.PlayerEntity_GetCompenstatePos, player_entity, args);
                 if (pos_result) {
                     auto* v3 = static_cast<unity::Vector3*>(mono::object_unbox(pos_result));
                     if (v3) { data.position = *v3; got_pos = true; }
@@ -412,7 +418,7 @@ static PlayerData read_entity(MonoObject* player_entity) {
 
     // Fallback: raw Gp() (still has Seed scaling, but better than nothing)
     if (!got_pos && fpos && s_methods.Fpos_Gp) {
-        MonoObject* pos_result = mono::runtime_invoke(s_methods.Fpos_Gp, fpos, nullptr, nullptr);
+        MonoObject* pos_result = invoke(s_methods.Fpos_Gp, fpos);
         if (pos_result) {
             auto* v3 = static_cast<unity::Vector3*>(mono::object_unbox(pos_result));
             if (v3) data.position = *v3;
@@ -505,7 +511,7 @@ std::vector<PlayerData> read_all_players() {
     }
 
     // Get all entities
-    MonoObject* entity_list = mono::runtime_invoke(s_ctx_get_entities, player_ctx, nullptr, nullptr);
+    MonoObject* entity_list = invoke(s_ctx_get_entities, player_ctx);
     if (!entity_list) {
         snprintf(dbg, sizeof(dbg), "ERR: entity_list=null. ctx_count=%d", ctx_count);
         s_debug_info = dbg;
@@ -541,7 +547,7 @@ std::vector<PlayerData> read_all_players() {
 
     for (int i = 0; i < count; i++) {
         void* idx_args[1] = { &i };
-        MonoObject* entity = mono::runtime_invoke(s_list_get_item, entity_list, idx_args, nullptr);
+        MonoObject* entity = invoke(s_list_get_item, entity_list, idx_args);
         if (!entity) continue;
 
         // Resolve HasComponent dynamically from the entity's runtime class
@@ -560,7 +566,7 @@ std::vector<PlayerData> read_all_players() {
         if (s_entity_has_comp) {
             int bi = IDX_BASIC_INFO;
             void* bi_args[1] = { &bi };
-            MonoObject* has_res = mono::runtime_invoke(s_entity_has_comp, entity, bi_args, nullptr);
+            MonoObject* has_res = invoke(s_entity_has_comp, entity, bi_args);
             if (!unbox_bool(has_res)) { skipped++; continue; }
         }
 
@@ -580,7 +586,7 @@ std::vector<PlayerData> read_all_players() {
         else if (s_entity_has_comp) {
             int mp = IDX_MY_PLAYER;
             void* mp_args[1] = { &mp };
-            MonoObject* is_local_res = mono::runtime_invoke(s_entity_has_comp, entity, mp_args, nullptr);
+            MonoObject* is_local_res = invoke(s_entity_has_comp, entity, mp_args);
             data.is_local = unbox_bool(is_local_res);
         }
 

@@ -75,9 +75,15 @@ static struct {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-static MonoObject* invoke(MonoMethod* method, MonoObject* obj) {
+// Exception-safe invoke: catches managed exceptions locally so they don't
+// longjmp past C++ stack frames (which would skip destructors of std::string,
+// std::vector etc. and corrupt the heap).
+static MonoObject* invoke(MonoMethod* method, MonoObject* obj,
+                          void** params = nullptr) {
     if (!method) return nullptr;
-    return mono::runtime_invoke(method, obj, nullptr, nullptr);
+    MonoObject* exc = nullptr;
+    MonoObject* ret = mono::runtime_invoke(method, obj, params, &exc);
+    return exc ? nullptr : ret;
 }
 
 static float normalize_angle(float angle) {
