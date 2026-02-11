@@ -1,0 +1,23 @@
+# Build output
+build/
+*.obj
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Temp
+*.log
+build_log.txt
+nul
+
+# Generated (can be regenerated from Payload.cs)
+tools/Payload.dll
