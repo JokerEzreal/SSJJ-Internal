@@ -175,6 +175,10 @@ static void dump_data_to_file() {
     if (aim_dbg) f << "Aimbot: " << aim_dbg << "\n";
     f << "\n";
 
+    f << "=== VISIBILITY DIAGNOSTICS ===\n";
+    f << visibility::dump_diagnostics();
+    f << "\n";
+
     // --- Reference: ECS component indices ---
     f << "=== COMPONENT INDICES (for reference) ===\n";
     f << "BasicInfo=17, Life=4, Orientation=6, Fpos=51\n";

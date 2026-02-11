@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../unity/unity_types.h"
+#include <string>
 
 namespace visibility {
 
@@ -19,6 +20,9 @@ bool is_visible_unity(const unity::Vector3& from_unity, const unity::Vector3& to
 
 // Debug info
 const char* get_debug_info();
+
+// Diagnostic dump (call from dump button context)
+std::string dump_diagnostics();
 
 // Cleanup
 void shutdown();

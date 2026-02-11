@@ -452,6 +452,19 @@ std::vector<PlayerData> read_all_players() {
     MonoObject* player_ctx = invoke(s_methods.Contexts_get_player, contexts);
     if (!player_ctx) { s_debug_info = "ERR: player_ctx=null"; return result; }
 
+    // Get myPlayerEntity pointer for is_local detection (pointer comparison)
+    MonoObject* my_player_entity = invoke(s_methods.PlayerContext_get_myPlayerEntity, player_ctx);
+
+    // Also read local player name as fallback for is_local detection
+    std::string local_name;
+    if (my_player_entity) {
+        MonoObject* local_bi = invoke(s_methods.PlayerEntity_get_basicInfo, my_player_entity);
+        if (local_bi) {
+            MonoObject* name_obj = invoke(s_methods.BasicInfo_get_PlayerName, local_bi);
+            if (name_obj) local_name = read_mono_string(reinterpret_cast<MonoString*>(name_obj));
+        }
+    }
+
     // Resolve GetEntities & get_count by walking the class hierarchy
     // (GetEntities is on generic base class Context<T>, not on PlayerContext directly)
     if (!s_ctx_get_entities && mono::object_get_class && mono::class_get_parent) {
@@ -537,6 +550,10 @@ std::vector<PlayerData> read_all_players() {
             if (ent_cls) {
                 s_entity_has_comp = mono::class_get_method_from_name(ent_cls, "HasComponent", 1);
             }
+            // Fallback: use pre-resolved method from PlayerEntity class
+            if (!s_entity_has_comp) {
+                s_entity_has_comp = s_methods.PlayerEntity_HasComponent;
+            }
         }
 
         // Check if entity has BasicInfo component
@@ -550,8 +567,17 @@ std::vector<PlayerData> read_all_players() {
         PlayerData data = read_entity(entity);
         data._raw_entity = entity;
 
-        // Check if this is local player
-        if (s_entity_has_comp) {
+        // Check if this is local player:
+        // Method 1: pointer comparison with myPlayerEntity (most reliable)
+        if (my_player_entity && entity == my_player_entity) {
+            data.is_local = true;
+        }
+        // Method 2: name matching fallback
+        else if (!local_name.empty() && data.name == local_name) {
+            data.is_local = true;
+        }
+        // Method 3: HasComponent(MyPlayer) fallback
+        else if (s_entity_has_comp) {
             int mp = IDX_MY_PLAYER;
             void* mp_args[1] = { &mp };
             MonoObject* is_local_res = mono::runtime_invoke(s_entity_has_comp, entity, mp_args, nullptr);
