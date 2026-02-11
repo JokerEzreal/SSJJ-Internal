@@ -9,6 +9,7 @@
 #include "game/player_info.h"
 #include "game/esp.h"
 #include "game/aimbot.h"
+#include "game/visibility.h"
 
 static DWORD WINAPI init_thread(LPVOID param)
 {
@@ -56,6 +57,9 @@ static DWORD WINAPI init_thread(LPVOID param)
     // Step 8b: Initialize aimbot module (no-recoil, etc.)
     aimbot::initialize();
 
+    // Step 8c: Initialize visibility (BspTrace raycast)
+    visibility::initialize();
+
     // Step 9: Load and execute C# payload
     if (!payload::initialize()) {
         MessageBoxA(nullptr, "Failed to load payload", "SSJJ-Internal", MB_OK | MB_ICONERROR);
@@ -100,6 +104,7 @@ static DWORD WINAPI init_thread(LPVOID param)
 
     // Cleanup
     payload::shutdown();
+    visibility::shutdown();
     aimbot::shutdown();
     esp::shutdown();
     player_info::shutdown();

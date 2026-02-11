@@ -4,6 +4,7 @@
 #include "../game/player_info.h"
 #include "../game/esp.h"
 #include "../game/aimbot.h"
+#include "../game/visibility.h"
 #include "../core/globals.h"
 
 #include <cstdio>
@@ -427,6 +428,12 @@ void on_gui() {
         const auto& pi_dbg = player_info::get_debug_info();
         if (!pi_dbg.empty()) {
             gui::label({x, y, w, LINE_H}, fmt("PI: %s", pi_dbg.c_str()));
+            y += LINE_H + GAP;
+        }
+
+        const char* vis_dbg = visibility::get_debug_info();
+        if (vis_dbg && vis_dbg[0]) {
+            gui::label({x, y, w, LINE_H}, fmt("VIS: %s", vis_dbg));
             y += LINE_H + GAP;
         }
 

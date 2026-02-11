@@ -1,6 +1,7 @@
 #include "aimbot.h"
 #include "player_info.h"
 #include "esp.h"
+#include "visibility.h"
 #include "../mono/mono_api.h"
 #include "../mono/mono_types.h"
 #include "../unity/unity_classes.h"
@@ -284,13 +285,44 @@ static void apply_aimbot() {
     unity::Vector3 eye = local_data.position;
     eye.z += EYE_HEIGHT;
 
-    // Find closest target to crosshair
+    // Local eye in Unity world coords (for bone visibility checks)
+    unity::Vector3 eye_unity;
+    eye_unity.x = -local_data.position.y;
+    eye_unity.y =  local_data.position.z + EYE_HEIGHT; // SSJJ Z → Unity Y
+    eye_unity.z =  local_data.position.x;
+
+    // Find best visible target with bone priority:
+    // 1. Head (if visible) - highest priority
+    // 2. Other visible bones - pick closest to crosshair
+    // 3. Head (even if occluded) - fallback if no visible bones
     float best_dist = AIM_FOV;
     float best_yaw  = 0.0f;
     float best_pitch = 0.0f;
     bool  found = false;
     bool  used_bone = false;
+    bool  target_visible = false;
     std::string target_name;
+    std::string target_bone_name;
+
+    // Bone priority for aiming (head first, then upper body, then limbs)
+    static const int BONE_PRIORITY[] = {
+        0,   // BONE_HEAD (highest)
+        1,   // BONE_NECK
+        2,   // BONE_SPINE2
+        3,   // BONE_SPINE1
+        4,   // BONE_SPINE
+        5,   // BONE_PELVIS
+        8,   // BONE_L_UPPER_ARM
+        9,   // BONE_R_UPPER_ARM
+        14,  // BONE_L_THIGH
+        15,  // BONE_R_THIGH
+    };
+    static const char* BONE_NAMES[] = {
+        "head", "neck", "spine2", "spine1", "spine", "pelvis",
+        "l_clav", "r_clav", "l_arm", "r_arm", "l_fore", "r_fore",
+        "l_hand", "r_hand", "l_thigh", "r_thigh", "l_calf", "r_calf",
+        "l_foot", "r_foot"
+    };
 
     for (const auto& p : players) {
         if (!p.valid || p.is_local || p.is_dead) continue;
@@ -300,37 +332,125 @@ static void apply_aimbot() {
         if (local_data.team_id >= 0 && p.team_id == local_data.team_id)
             continue;
 
-        // Target head position - prefer actual head bone transform
-        unity::Vector3 head;
-        unity::Vector3 head_unity;
-        bool bone_ok = false;
-        if (p._raw_entity && esp::get_head_bone_world_pos(p._raw_entity, head_unity)) {
-            // Convert Unity world coords -> SSJJ coords
-            // SSJJ(x,y,z) -> Unity(-y, z, x), reverse: Unity(ux,uy,uz) -> SSJJ(uz, -ux, uy)
-            head.x = head_unity.z;
-            head.y = -head_unity.x;
-            head.z = head_unity.y;
-            bone_ok = true;
-        } else {
-            // Fallback to estimated position
-            head = p.position;
-            head.z += HEAD_HEIGHT;
+        // Try to get per-bone visibility data
+        esp::BoneTarget bone_targets[20] = {};
+        int bone_count = 0;
+        if (p._raw_entity) {
+            bone_count = esp::get_bone_targets(p._raw_entity, eye_unity,
+                                                bone_targets, 20);
         }
 
-        // Angle from our eye to their head
-        float ty, tp;
-        calc_angle(eye, head, ty, tp);
+        // Strategy: find the best visible bone for this player
+        // Priority: visible head > visible body bone > any head (no vis check)
+        float player_best_dist = AIM_FOV;
+        float player_best_yaw = 0, player_best_pitch = 0;
+        bool  player_found = false;
+        bool  player_bone_ok = false;
+        bool  player_vis = false;
+        int   player_best_bone = -1;
 
-        // How far from our current crosshair?
-        float dist = angular_distance(cur_yaw, cur_pitch, ty, tp);
+        if (bone_count > 0) {
+            // First pass: look for visible bones (prioritize head)
+            for (int pri_idx = 0; pri_idx < 10; pri_idx++) {
+                int bi = BONE_PRIORITY[pri_idx];
+                if (bi >= 20 || !bone_targets[bi].valid) continue;
+                if (!bone_targets[bi].visible) continue;
 
-        if (dist < best_dist) {
-            best_dist   = dist;
-            best_yaw    = ty;
-            best_pitch  = tp;
+                // Convert bone Unity pos → SSJJ
+                unity::Vector3 bone_ssjj;
+                bone_ssjj.x =  bone_targets[bi].world_pos.z;
+                bone_ssjj.y = -bone_targets[bi].world_pos.x;
+                bone_ssjj.z =  bone_targets[bi].world_pos.y;
+
+                float ty, tp;
+                calc_angle(eye, bone_ssjj, ty, tp);
+                float dist = angular_distance(cur_yaw, cur_pitch, ty, tp);
+
+                // Head gets a bonus (accept even if not closest)
+                if (bi == 0) { // BONE_HEAD
+                    player_best_dist = dist;
+                    player_best_yaw = ty;
+                    player_best_pitch = tp;
+                    player_found = true;
+                    player_bone_ok = true;
+                    player_vis = true;
+                    player_best_bone = bi;
+                    break; // Head visible = best possible target
+                }
+
+                if (dist < player_best_dist) {
+                    player_best_dist = dist;
+                    player_best_yaw = ty;
+                    player_best_pitch = tp;
+                    player_found = true;
+                    player_bone_ok = true;
+                    player_vis = true;
+                    player_best_bone = bi;
+                }
+            }
+
+            // Second pass: if no visible bone found, use head anyway (fallback)
+            if (!player_found && bone_targets[0].valid) {
+                unity::Vector3 head_ssjj;
+                head_ssjj.x =  bone_targets[0].world_pos.z;
+                head_ssjj.y = -bone_targets[0].world_pos.x;
+                head_ssjj.z =  bone_targets[0].world_pos.y;
+
+                float ty, tp;
+                calc_angle(eye, head_ssjj, ty, tp);
+                player_best_dist = angular_distance(cur_yaw, cur_pitch, ty, tp);
+                player_best_yaw = ty;
+                player_best_pitch = tp;
+                player_found = true;
+                player_bone_ok = true;
+                player_vis = false;
+                player_best_bone = 0;
+            }
+        }
+
+        // Fallback: no bone data at all, use estimated head position
+        if (!player_found) {
+            unity::Vector3 head = p.position;
+            head.z += HEAD_HEIGHT;
+
+            // Try to get head bone from esp
+            unity::Vector3 head_unity_pos;
+            if (p._raw_entity && esp::get_head_bone_world_pos(p._raw_entity, head_unity_pos)) {
+                head.x = head_unity_pos.z;
+                head.y = -head_unity_pos.x;
+                head.z = head_unity_pos.y;
+                player_bone_ok = true;
+            }
+
+            float ty, tp;
+            calc_angle(eye, head, ty, tp);
+            player_best_dist = angular_distance(cur_yaw, cur_pitch, ty, tp);
+            player_best_yaw = ty;
+            player_best_pitch = tp;
+            player_found = true;
+            player_best_bone = 0;
+        }
+
+        if (!player_found) continue;
+
+        // Compare against global best: prefer visible targets over occluded
+        bool better = false;
+        if (player_vis && !target_visible) {
+            better = true; // visible target always beats occluded
+        } else if (player_vis == target_visible) {
+            better = (player_best_dist < best_dist); // same visibility: closest wins
+        }
+
+        if (better && player_best_dist < AIM_FOV) {
+            best_dist   = player_best_dist;
+            best_yaw    = player_best_yaw;
+            best_pitch  = player_best_pitch;
             found       = true;
-            used_bone   = bone_ok;
+            used_bone   = player_bone_ok;
+            target_visible = player_vis;
             target_name = p.name;
+            target_bone_name = (player_best_bone >= 0 && player_best_bone < 20)
+                ? BONE_NAMES[player_best_bone] : "?";
         }
     }
 
@@ -357,9 +477,10 @@ static void apply_aimbot() {
     write_orientation(pe, aim_yaw, aim_pitch);
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "AIM: -> %s (%.1f deg) punch=(%.1f,%.1f) head=%s src=%s",
-        target_name.c_str(), best_dist, punch_yaw, punch_pitch,
-        used_bone ? "bone" : "est",
+    snprintf(buf, sizeof(buf), "AIM: -> %s [%s] (%.1f deg) vis=%s punch=(%.1f,%.1f) src=%s",
+        target_name.c_str(), target_bone_name.c_str(), best_dist,
+        target_visible ? "Y" : "N",
+        punch_yaw, punch_pitch,
         (input && s_fields.Input_Yaw) ? "input" : "orient");
     s_debug = buf;
 }

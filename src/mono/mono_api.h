@@ -83,4 +83,8 @@ namespace mono {
     extern mono_gchandle_free_fn        gchandle_free;
     extern mono_gchandle_get_target_fn  gchandle_get_target;
 
+    // Array
+    extern mono_array_new_fn            array_new;
+    extern mono_get_single_class_fn     get_single_class;
+
 } // namespace mono

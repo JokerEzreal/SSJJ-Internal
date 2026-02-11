@@ -34,6 +34,21 @@ void request_bone_dump();
 // Returns false if skeleton data unavailable (falls back to estimated).
 bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out);
 
+// Bone visibility data for aimbot
+struct BoneTarget {
+    unity::Vector3 world_pos;  // Unity world coords
+    bool valid;                // bone was found
+    bool visible;              // not occluded by walls
+    int bone_id;               // BoneId enum value
+};
+
+// Get all bone positions and visibility for a player entity.
+// eye_unity = local player eye in Unity world coords.
+// Returns number of valid bones found.
+int get_bone_targets(MonoObject* player_entity,
+                     const unity::Vector3& eye_unity,
+                     BoneTarget* out, int max_bones);
+
 void shutdown();
 
 } // namespace esp

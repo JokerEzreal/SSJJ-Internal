@@ -1,5 +1,6 @@
 #include "esp.h"
 #include "player_info.h"
+#include "visibility.h"
 #include "../gui/gui.h"
 #include "../mono/mono_api.h"
 #include "../mono/mono_types.h"
@@ -454,9 +455,15 @@ static void dump_bone_names(MonoObject* transform, std::string& out,
 }
 
 // Draw skeleton for a single player entity
+// vis_col = color for visible bones, occ_col = color for occluded bones
+// eye_unity = local player eye in Unity world coords (for visibility checks)
+// vis_enabled = whether to do per-bone visibility checks
 static bool draw_player_skeleton(MonoObject* player_entity,
                                  float screen_w, float screen_h,
-                                 const unity::Color& col,
+                                 const unity::Color& vis_col,
+                                 const unity::Color& occ_col,
+                                 const unity::Vector3* eye_unity,
+                                 bool vis_enabled,
                                  bool do_debug_dump = false)
 {
     if (!player_entity) return false;
@@ -528,33 +535,46 @@ static bool draw_player_skeleton(MonoObject* player_entity,
             ScreenPos sp_head = world_to_screen(head_pos, screen_w, screen_h);
             ScreenPos sp_body = world_to_screen(body_pos, screen_w, screen_h);
             if (sp_head.visible && sp_body.visible) {
-                draw_line(sp_body.x, sp_body.y, sp_head.x, sp_head.y, 2.0f, col);
-                draw_filled_rect(sp_head.x - 3, sp_head.y - 3, 6, 6, col);
-                draw_filled_rect(sp_body.x - 3, sp_body.y - 3, 6, 6, col);
+                bool head_vis = !vis_enabled || !eye_unity ||
+                    visibility::is_visible_unity(*eye_unity, head_pos);
+                unity::Color c = head_vis ? vis_col : occ_col;
+                draw_line(sp_body.x, sp_body.y, sp_head.x, sp_head.y, 2.0f, c);
+                draw_filled_rect(sp_head.x - 3, sp_head.y - 3, 6, 6, c);
+                draw_filled_rect(sp_body.x - 3, sp_body.y - 3, 6, 6, c);
             }
             return true;
         }
         return false;
     }
 
-    // Get screen positions for all found bones
+    // Get world and screen positions for all found bones, check visibility
     ScreenPos scr[BONE_COUNT] = {};
+    unity::Vector3 world_pos[BONE_COUNT] = {};
+    bool bone_visible[BONE_COUNT] = {};  // true = not occluded by walls
     for (int i = 0; i < BONE_COUNT; i++) {
         if (!bones[i]) continue;
-        unity::Vector3 pos;
-        if (get_transform_position(bones[i], pos)) {
-            scr[i] = world_to_screen(pos, screen_w, screen_h);
+        if (get_transform_position(bones[i], world_pos[i])) {
+            scr[i] = world_to_screen(world_pos[i], screen_w, screen_h);
+            // Visibility check (only for on-screen bones to save perf)
+            if (scr[i].visible && vis_enabled && eye_unity) {
+                bone_visible[i] = visibility::is_visible_unity(*eye_unity, world_pos[i]);
+            } else {
+                bone_visible[i] = true; // no check = assume visible
+            }
         }
     }
 
-    // Draw chain: connect consecutive found bones, skipping missing ones
+    // Draw chain: connect consecutive found bones, color by visibility
     auto draw_chain = [&](const BoneId* chain, int len) {
         int prev = -1;
         for (int i = 0; i < len; i++) {
             int idx = (int)chain[i];
             if (!bones[idx] || !scr[idx].visible) continue;
             if (prev >= 0 && scr[prev].visible) {
-                draw_line(scr[prev].x, scr[prev].y, scr[idx].x, scr[idx].y, 2.0f, col);
+                // Use visible color if either endpoint is visible
+                bool seg_vis = bone_visible[prev] || bone_visible[idx];
+                unity::Color c = seg_vis ? vis_col : occ_col;
+                draw_line(scr[prev].x, scr[prev].y, scr[idx].x, scr[idx].y, 2.0f, c);
             }
             prev = idx;
         }
@@ -587,10 +607,11 @@ static bool draw_player_skeleton(MonoObject* player_entity,
     draw_chain(L_LEG, 4);
     draw_chain(R_LEG, 4);
 
-    // Draw joint dots
+    // Draw joint dots (colored by visibility)
     for (int i = 0; i < BONE_COUNT; i++) {
         if (bones[i] && scr[i].visible) {
-            draw_filled_rect(scr[i].x - 2, scr[i].y - 2, 4, 4, col);
+            unity::Color c = bone_visible[i] ? vis_col : occ_col;
+            draw_filled_rect(scr[i].x - 2, scr[i].y - 2, 4, 4, c);
         }
     }
 
@@ -650,6 +671,80 @@ bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
     if (!head_tf) return false;
 
     return get_transform_position(head_tf, out);
+}
+
+// ---------------------------------------------------------------------------
+// Get bone positions + visibility for aimbot (reuses skeleton cache)
+// ---------------------------------------------------------------------------
+int get_bone_targets(MonoObject* player_entity,
+                     const unity::Vector3& eye_unity,
+                     BoneTarget* out, int max_bones)
+{
+    init_skeleton_cache();
+
+    if (!player_entity || !out || max_bones <= 0) return 0;
+    if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
+        !s_skel.PE_get_thirdPersonUnityObjects) return 0;
+
+    // Check hasThirdPersonUnityObjects
+    MonoObject* has_res = mono::runtime_invoke(
+        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
+        return 0;
+
+    MonoObject* tpu = mono::runtime_invoke(
+        s_skel.PE_get_thirdPersonUnityObjects, player_entity, nullptr, nullptr);
+    if (!tpu || !s_skel.TPU_ThirdTran) return 0;
+
+    MonoObject* third_tran = nullptr;
+    mono::field_get_value(tpu, s_skel.TPU_ThirdTran, &third_tran);
+    if (!third_tran) return 0;
+
+    // Resolve fields if needed
+    if (!s_skel.fields_resolved && mono::object_get_class) {
+        MonoClass* tt_cls = mono::object_get_class(third_tran);
+        if (tt_cls) {
+            s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
+            s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
+            s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
+            s_skel.fields_resolved = true;
+        }
+    }
+
+    MonoObject* root_go = nullptr;
+    if (s_skel.TT_RootContainer)
+        mono::field_get_value(third_tran, s_skel.TT_RootContainer, &root_go);
+    if (!root_go) return 0;
+
+    MonoMethod* get_tf = unity::methods().GameObject_get_transform;
+    if (!get_tf) return 0;
+    MonoObject* root_transform = mono::runtime_invoke(get_tf, root_go, nullptr, nullptr);
+    if (!root_transform) return 0;
+
+    // Collect bones
+    MonoObject* bones[BONE_COUNT] = {};
+    int found = 0;
+    collect_bones(root_transform, bones, 0, 15, found);
+
+    // Fill output with position + visibility
+    int count = 0;
+    int limit = (max_bones < BONE_COUNT) ? max_bones : BONE_COUNT;
+    for (int i = 0; i < limit; i++) {
+        out[i].bone_id = i;
+        out[i].valid = false;
+        out[i].visible = false;
+        if (!bones[i]) continue;
+
+        unity::Vector3 pos;
+        if (!get_transform_position(bones[i], pos)) continue;
+
+        out[i].world_pos = pos;
+        out[i].valid = true;
+        out[i].visible = visibility::is_visible_unity(eye_unity, pos);
+        count++;
+    }
+
+    return count;
 }
 
 void draw() {
@@ -814,16 +909,41 @@ void draw() {
     // --------------- Skeleton ESP pass ---------------
     // Reuses the same player data from box ESP (no second entity enumeration).
     // Filtering (local/dead/teammate) already done by the same criteria.
+
+    // Compute local eye position in SSJJ coords for visibility checks
+    // (We need it in SSJJ for the BspTrace, but is_visible_unity will
+    //  receive it as "eye_ssjj" and convert target bones from Unity coords)
+    // Actually: we pass eye as Unity coords since is_visible_unity expects both Unity.
+    // Let's compute eye in Unity world coords from the local player data.
+    unity::Vector3 eye_unity;
+    bool have_eye = false;
+    for (const auto& p : players) {
+        if (p.is_local && p.valid) {
+            // SSJJ pos → Unity: SSJJ(x,y,z) → Unity(-y, z, x)
+            eye_unity.x = -p.position.y;
+            eye_unity.y =  p.position.z + 150.0f; // eye height above feet (SSJJ Z → Unity Y)
+            eye_unity.z =  p.position.x;
+            have_eye = true;
+            break;
+        }
+    }
+
     int skel_drawn = 0;
     if (s_skeleton_enabled && s_skel.PE_get_thirdPersonUnityObjects) {
+        unity::Color vis_col(0.0f, 1.0f, 0.5f, 1.0f); // green = visible
+        unity::Color occ_col(1.0f, 0.3f, 0.0f, 0.8f);  // orange = occluded
+
         for (const auto& p : players) {
             if (!p.valid || p.is_local || p.is_dead) continue;
             if (local_team >= 0 && p.team_id == local_team) continue;
             if (!p._raw_entity) continue;
 
-            unity::Color skel_col(0.0f, 1.0f, 0.5f, 1.0f); // green
             bool debug_first = (skel_drawn == 0);
-            if (draw_player_skeleton(p._raw_entity, screen_w, screen_h, skel_col, debug_first))
+            if (draw_player_skeleton(p._raw_entity, screen_w, screen_h,
+                                     vis_col, occ_col,
+                                     have_eye ? &eye_unity : nullptr,
+                                     have_eye,
+                                     debug_first))
                 skel_drawn++;
         }
     }

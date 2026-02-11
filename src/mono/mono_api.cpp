@@ -79,6 +79,10 @@ namespace mono {
     mono_gchandle_free_fn        gchandle_free       = nullptr;
     mono_gchandle_get_target_fn  gchandle_get_target = nullptr;
 
+    // Array
+    mono_array_new_fn            array_new           = nullptr;
+    mono_get_single_class_fn     get_single_class    = nullptr;
+
     // ========================================================================
     // Internal state
     // ========================================================================
@@ -166,6 +170,9 @@ namespace mono {
         resolve(s_mono_module, "mono_gchandle_free",               gchandle_free);
         resolve(s_mono_module, "mono_gchandle_get_target",         gchandle_get_target);
 
+        resolve(s_mono_module, "mono_array_new",                   array_new);
+        resolve(s_mono_module, "mono_get_single_class",            get_single_class);
+
         // Validate critical functions required for basic operation
         if (!get_root_domain || !thread_attach || !class_from_name || !runtime_invoke) {
             shutdown();
@@ -231,6 +238,9 @@ namespace mono {
         gchandle_new        = nullptr;
         gchandle_free       = nullptr;
         gchandle_get_target = nullptr;
+
+        array_new           = nullptr;
+        get_single_class    = nullptr;
 
         // We obtained the handle via GetModuleHandle (not LoadLibrary),
         // so we do not call FreeLibrary.

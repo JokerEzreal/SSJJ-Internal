@@ -109,3 +109,7 @@ typedef void* (*mono_compile_method_fn)(MonoMethod* method);
 typedef uint32_t    (*mono_gchandle_new_fn)(MonoObject* obj, mono_bool pinned);
 typedef void        (*mono_gchandle_free_fn)(uint32_t gchandle);
 typedef MonoObject* (*mono_gchandle_get_target_fn)(uint32_t gchandle);
+
+// Array
+typedef MonoArray*  (*mono_array_new_fn)(MonoDomain* domain, MonoClass* eclass, uintptr_t n);
+typedef MonoClass*  (*mono_get_single_class_fn)();
