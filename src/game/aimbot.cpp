@@ -66,6 +66,8 @@ static struct {
     // InputComponent fields (source of truth for aim direction)
     MonoClassField* Input_Yaw        = nullptr;
     MonoClassField* Input_Pitch      = nullptr;
+    MonoClassField* Input_TempYaw    = nullptr;   // double - high precision accumulator
+    MonoClassField* Input_TempPitch  = nullptr;   // double - high precision accumulator
 } s_fields;
 
 // ---------------------------------------------------------------------------
@@ -141,10 +143,14 @@ bool initialize() {
 
     // Fields -- InputComponent (source of truth for aim direction)
     if (s_classes.InputComponent && mono::class_get_field_from_name) {
-        s_fields.Input_Yaw   = mono::class_get_field_from_name(
+        s_fields.Input_Yaw       = mono::class_get_field_from_name(
             s_classes.InputComponent, "Yaw");
-        s_fields.Input_Pitch = mono::class_get_field_from_name(
+        s_fields.Input_Pitch     = mono::class_get_field_from_name(
             s_classes.InputComponent, "Pitch");
+        s_fields.Input_TempYaw   = mono::class_get_field_from_name(
+            s_classes.InputComponent, "TempYaw");
+        s_fields.Input_TempPitch = mono::class_get_field_from_name(
+            s_classes.InputComponent, "TempPitch");
     }
 
     return true;
@@ -202,6 +208,13 @@ static void write_input(MonoObject* input, float yaw, float pitch) {
     if (!input) return;
     if (s_fields.Input_Yaw)   mono::field_set_value(input, s_fields.Input_Yaw, &yaw);
     if (s_fields.Input_Pitch) mono::field_set_value(input, s_fields.Input_Pitch, &pitch);
+    // Must also set TempYaw/TempPitch (double) -- these are high-precision
+    // accumulators. If we only set Yaw/Pitch, the game's next frame will
+    // compute Yaw from TempYaw + mouse_delta and overwrite our value.
+    double temp_yaw   = static_cast<double>(yaw);
+    double temp_pitch = static_cast<double>(pitch);
+    if (s_fields.Input_TempYaw)   mono::field_set_value(input, s_fields.Input_TempYaw, &temp_yaw);
+    if (s_fields.Input_TempPitch) mono::field_set_value(input, s_fields.Input_TempPitch, &temp_pitch);
 }
 
 static void write_orientation(MonoObject* pe, float yaw, float pitch) {
