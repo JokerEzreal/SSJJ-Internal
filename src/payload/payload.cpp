@@ -7,6 +7,7 @@
 #include "../game/esp.h"
 #include "../game/aimbot.h"
 #include "../game/anticheat.h"
+#include "../game/frame_cache.h"
 
 #include <cstdio>
 #include <atomic>
@@ -31,6 +32,7 @@ static MonoMethod* s_loader_init = nullptr;
 static void __cdecl on_draw_esp()
 {
     s_heartbeat.fetch_add(1, std::memory_order_relaxed);
+    frame_cache::begin_frame();  // start per-frame caching (shared by ESP + aimbot)
     esp::draw();
 }
 
@@ -58,6 +60,7 @@ static void __cdecl on_late_update_callback()
     // Aimbot runs in LateUpdate so it writes orientation AFTER the game's
     // ECS systems have processed input during Update.
     aimbot::update();
+    frame_cache::end_frame();  // end per-frame caching (last callback)
 }
 
 // ---------------------------------------------------------------------------

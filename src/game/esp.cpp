@@ -1,4 +1,5 @@
 #include "esp.h"
+#include "frame_cache.h"
 #include "player_info.h"
 #include "visibility.h"
 #include "../gui/gui.h"
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <Windows.h>
 
 namespace esp {
@@ -466,18 +468,67 @@ static void dump_bone_names(MonoObject* transform, std::string& out,
     }
 }
 
-// Draw skeleton for a single player entity
-// vis_col = color for visible bones, occ_col = color for occluded bones
-// eye_unity = local player eye in Unity world coords (for visibility checks)
-// vis_enabled = whether to do per-bone visibility checks
-static bool draw_player_skeleton(MonoObject* player_entity,
-                                 float screen_w, float screen_h,
-                                 const unity::Color& vis_col,
-                                 const unity::Color& occ_col,
-                                 const unity::Vector3* eye_unity,
-                                 bool vis_enabled,
-                                 bool do_debug_dump = false)
+// ---------------------------------------------------------------------------
+// Persistent bone transform cache
+// ---------------------------------------------------------------------------
+// The bone hierarchy structure (which Transform maps to which BoneId) does
+// not change between frames -- only the bone POSITIONS change.  So we cache
+// the BoneId->Transform* mapping after the first collect_bones() call and
+// on subsequent frames just read Transform.get_position() directly (1 invoke
+// per bone) instead of re-walking the entire name-based hierarchy (~120
+// invokes per player).
+// ---------------------------------------------------------------------------
+
+struct CachedSkeleton {
+    MonoObject* transforms[BONE_COUNT] = {};  // cached Transform* per bone
+    int found = 0;                            // how many bones were found
+    bool has_fallback = false;                // true if using ThirdTran head/body
+    MonoObject* fallback_head = nullptr;      // ThirdTran.HeadTransform
+    MonoObject* fallback_body = nullptr;      // ThirdTran.BodyTransform
+    uint32_t frame_cached = 0;                // frame when this entry was populated
+    uint32_t frame_validated = 0;             // frame when we last verified still valid
+};
+
+static std::unordered_map<MonoObject*, CachedSkeleton> s_skeleton_cache;
+static uint32_t s_cache_frame = 0;            // global frame counter for cache
+
+// Interval (in frames) between full revalidation of a cached skeleton entry.
+// During revalidation we check that the RootContainer is still alive and
+// the child count hasn't changed (which would indicate a model swap).
+static constexpr uint32_t CACHE_VALIDATE_INTERVAL = 60;
+
+// Maximum number of entries before we force a full clear (prevents unbounded
+// growth from players joining/leaving over a long session).
+static constexpr size_t   CACHE_MAX_ENTRIES = 64;
+
+// Clear the entire skeleton cache (call on map change / shutdown)
+static void clear_skeleton_cache() {
+    s_skeleton_cache.clear();
+}
+
+// Resolve ThirdTran fields from the actual ThirdTran object if not done yet.
+// Needed before accessing HeadTransform/BodyTransform/RootContainer.
+static void resolve_third_tran_fields(MonoObject* third_tran) {
+    if (s_skel.fields_resolved || !mono::object_get_class) return;
+    MonoClass* tt_cls = mono::object_get_class(third_tran);
+    if (tt_cls) {
+        s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
+        s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
+        s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
+        s_skel.fields_resolved = true;
+    }
+}
+
+// Common helper: given a player entity, walk to ThirdTran and RootContainer's
+// root Transform.  Returns false if any step fails.  On success, fills out
+// third_tran_out and root_transform_out.
+static bool get_skeleton_root(MonoObject* player_entity,
+                              MonoObject*& third_tran_out,
+                              MonoObject*& root_transform_out)
 {
+    third_tran_out = nullptr;
+    root_transform_out = nullptr;
+
     if (!player_entity) return false;
     if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
         !s_skel.PE_get_thirdPersonUnityObjects) return false;
@@ -491,24 +542,15 @@ static bool draw_player_skeleton(MonoObject* player_entity,
     // Get ThirdPersonUnityObjectsComponent
     MonoObject* tpu = invoke_safe(
         s_skel.PE_get_thirdPersonUnityObjects, player_entity);
-    if (!tpu) return false;
+    if (!tpu || !s_skel.TPU_ThirdTran) return false;
 
     // Read ThirdTran field
-    if (!s_skel.TPU_ThirdTran) return false;
     MonoObject* third_tran = nullptr;
     mono::field_get_value(tpu, s_skel.TPU_ThirdTran, &third_tran);
     if (!third_tran) return false;
 
     // Resolve ThirdTran fields dynamically on first use
-    if (!s_skel.fields_resolved && mono::object_get_class) {
-        MonoClass* tt_cls = mono::object_get_class(third_tran);
-        if (tt_cls) {
-            s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
-            s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
-            s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
-            s_skel.fields_resolved = true;
-        }
-    }
+    resolve_third_tran_fields(third_tran);
 
     // Get RootContainer (GameObject) -> transform
     MonoObject* root_go = nullptr;
@@ -518,31 +560,186 @@ static bool draw_player_skeleton(MonoObject* player_entity,
 
     MonoMethod* get_tf = unity::methods().GameObject_get_transform;
     if (!get_tf) return false;
-    MonoObject* root_transform = invoke_safe(get_tf, root_go);
-    if (!root_transform) return false;
+    MonoObject* root_tf = invoke_safe(get_tf, root_go);
+    if (!root_tf) return false;
 
-    // Debug dump: collect all bone names (only for first player, once)
-    if (do_debug_dump && s_bone_debug.empty()) {
-        dump_bone_names(root_transform, s_bone_debug, 0, 15);
+    third_tran_out = third_tran;
+    root_transform_out = root_tf;
+    return true;
+}
+
+// Validate that a cached skeleton entry is still usable.  Performs a cheap
+// check: reads the root transform's child count.  If it returns 0 or the
+// call fails, the entity's model is likely gone or swapped.
+// Returns true if the cached entry is still valid.
+static bool validate_cached_skeleton(const CachedSkeleton& cached) {
+    // For fallback entries (head/body only), verify the head transform
+    // is still alive by trying to read its position.
+    if (cached.has_fallback) {
+        if (!cached.fallback_head) return false;
+        unity::Vector3 tmp;
+        return get_transform_position(cached.fallback_head, tmp);
     }
 
-    // Collect bone transforms by name classification
-    MonoObject* bones[BONE_COUNT] = {};
-    int found = 0;
-    collect_bones(root_transform, bones, 0, 15, found);
+    // For full skeleton entries, check that the first found bone transform
+    // still returns a valid position.  This catches model destruction and
+    // entity recycling.
+    for (int i = 0; i < BONE_COUNT; i++) {
+        if (cached.transforms[i]) {
+            unity::Vector3 tmp;
+            return get_transform_position(cached.transforms[i], tmp);
+        }
+    }
+    return false;  // no transforms at all
+}
 
-    if (found < 3) {
-        // Fallback: draw head + body from ThirdTran fields
-        MonoObject* head_tf = nullptr;
-        MonoObject* body_tf = nullptr;
+// Look up or populate the skeleton cache for a given entity.
+// Fills bones[BONE_COUNT] with cached Transform pointers and returns
+// the number of bones found.  Also populates fallback_head/fallback_body
+// in the CachedSkeleton if the full hierarchy walk finds < 3 bones.
+// Returns a pointer to the cached entry (nullptr on total failure).
+static CachedSkeleton* get_or_populate_skeleton(MonoObject* player_entity)
+{
+    if (!player_entity) return nullptr;
+
+    // The cache is cleared every frame in draw(), so within a single frame
+    // we can safely use the cached entry without cross-frame validation.
+    auto it = s_skeleton_cache.find(player_entity);
+    if (it != s_skeleton_cache.end()) {
+        return &it->second;
+    }
+
+    // Cache miss (or stale eviction) -- do the full collect_bones() traversal
+    MonoObject* third_tran = nullptr;
+    MonoObject* root_transform = nullptr;
+    if (!get_skeleton_root(player_entity, third_tran, root_transform))
+        return nullptr;
+
+    CachedSkeleton entry = {};
+    entry.frame_cached = s_cache_frame;
+    entry.frame_validated = s_cache_frame;
+
+    collect_bones(root_transform, entry.transforms, 0, 15, entry.found);
+
+    if (entry.found < 3 && third_tran) {
+        // Fallback: cache ThirdTran head/body transforms directly
+        entry.has_fallback = true;
         if (s_skel.TT_HeadTransform)
-            mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &head_tf);
+            mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &entry.fallback_head);
         if (s_skel.TT_BodyTransform)
-            mono::field_get_value(third_tran, s_skel.TT_BodyTransform, &body_tf);
+            mono::field_get_value(third_tran, s_skel.TT_BodyTransform, &entry.fallback_body);
+    }
 
+    auto result = s_skeleton_cache.emplace(player_entity, entry);
+    return &result.first->second;
+}
+
+// ---------------------------------------------------------------------------
+// Smart visibility propagation
+// ---------------------------------------------------------------------------
+// Instead of raycasting all 20 bones, check only 3 key bones (HEAD, SPINE1,
+// PELVIS) and propagate visibility to nearby bones.  This reduces the number
+// of BspTrace WorldTrace calls from ~20 to 3 per player.
+//
+// Propagation rules:
+//   HEAD visible   -> NECK inherits
+//   SPINE1 visible -> SPINE2, SPINE, NECK inherit
+//   PELVIS visible -> SPINE inherits
+//   Upper body (SPINE2/NECK) visible -> arm chain bones inherit
+//   PELVIS visible -> leg chain bones inherit
+// ---------------------------------------------------------------------------
+static void compute_smart_visibility(const unity::Vector3& eye_unity,
+                                     unity::Vector3 world_pos[BONE_COUNT],
+                                     bool bones_valid[BONE_COUNT],
+                                     bool bone_visible[BONE_COUNT])
+{
+    // Initialize all as not visible
+    for (int i = 0; i < BONE_COUNT; i++)
+        bone_visible[i] = false;
+
+    // Raycast the 3 key bones
+    bool head_vis   = false;
+    bool spine1_vis = false;
+    bool pelvis_vis = false;
+
+    if (bones_valid[BONE_HEAD])
+        head_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_HEAD]);
+    if (bones_valid[BONE_SPINE1])
+        spine1_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_SPINE1]);
+    if (bones_valid[BONE_PELVIS])
+        pelvis_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_PELVIS]);
+
+    // Set the directly-checked bones
+    bone_visible[BONE_HEAD]   = head_vis;
+    bone_visible[BONE_SPINE1] = spine1_vis;
+    bone_visible[BONE_PELVIS] = pelvis_vis;
+
+    // Propagate: NECK inherits from HEAD or SPINE1
+    bone_visible[BONE_NECK] = head_vis || spine1_vis;
+
+    // Propagate: SPINE2 inherits from SPINE1 (or HEAD as backup)
+    bone_visible[BONE_SPINE2] = spine1_vis || head_vis;
+
+    // Propagate: SPINE inherits from SPINE1 or PELVIS
+    bone_visible[BONE_SPINE] = spine1_vis || pelvis_vis;
+
+    // Propagate: upper body visible = any of SPINE2/NECK/SPINE1 visible
+    bool upper_body_vis = spine1_vis || head_vis;
+
+    // Arm bones inherit from upper body visibility
+    bone_visible[BONE_L_CLAVICLE]  = upper_body_vis;
+    bone_visible[BONE_R_CLAVICLE]  = upper_body_vis;
+    bone_visible[BONE_L_UPPER_ARM] = upper_body_vis;
+    bone_visible[BONE_R_UPPER_ARM] = upper_body_vis;
+    bone_visible[BONE_L_FOREARM]   = upper_body_vis;
+    bone_visible[BONE_R_FOREARM]   = upper_body_vis;
+    bone_visible[BONE_L_HAND]      = upper_body_vis;
+    bone_visible[BONE_R_HAND]      = upper_body_vis;
+
+    // Leg bones inherit from PELVIS visibility
+    bone_visible[BONE_L_THIGH] = pelvis_vis;
+    bone_visible[BONE_R_THIGH] = pelvis_vis;
+    bone_visible[BONE_L_CALF]  = pelvis_vis;
+    bone_visible[BONE_R_CALF]  = pelvis_vis;
+    bone_visible[BONE_L_FOOT]  = pelvis_vis;
+    bone_visible[BONE_R_FOOT]  = pelvis_vis;
+}
+
+// ---------------------------------------------------------------------------
+// Draw skeleton for a single player entity
+// vis_col = color for visible bones, occ_col = color for occluded bones
+// eye_unity = local player eye in Unity world coords (for visibility checks)
+// vis_enabled = whether to do per-bone visibility checks
+// ---------------------------------------------------------------------------
+static bool draw_player_skeleton(MonoObject* player_entity,
+                                 float screen_w, float screen_h,
+                                 const unity::Color& vis_col,
+                                 const unity::Color& occ_col,
+                                 const unity::Vector3* eye_unity,
+                                 bool vis_enabled,
+                                 bool do_debug_dump = false)
+{
+    if (!player_entity) return false;
+
+    // Get or populate cached skeleton for this entity
+    CachedSkeleton* cached = get_or_populate_skeleton(player_entity);
+    if (!cached) return false;
+
+    // Debug dump: if requested and this is the first skeleton, do a full dump
+    // (this path is rare -- only triggered by explicit bone dump request)
+    if (do_debug_dump && s_bone_debug.empty()) {
+        MonoObject* third_tran = nullptr;
+        MonoObject* root_transform = nullptr;
+        if (get_skeleton_root(player_entity, third_tran, root_transform)) {
+            dump_bone_names(root_transform, s_bone_debug, 0, 15);
+        }
+    }
+
+    // Handle fallback path (head + body only)
+    if (cached->found < 3 && cached->has_fallback) {
         unity::Vector3 head_pos, body_pos;
-        bool has_head = get_transform_position(head_tf, head_pos);
-        bool has_body = get_transform_position(body_tf, body_pos);
+        bool has_head = get_transform_position(cached->fallback_head, head_pos);
+        bool has_body = get_transform_position(cached->fallback_body, body_pos);
         if (has_head && has_body) {
             ScreenPos sp_head = world_to_screen(head_pos, screen_w, screen_h);
             ScreenPos sp_body = world_to_screen(body_pos, screen_w, screen_h);
@@ -559,21 +756,29 @@ static bool draw_player_skeleton(MonoObject* player_entity,
         return false;
     }
 
-    // Get world and screen positions for all found bones, check visibility
+    if (cached->found < 3) return false;
+
+    // Read world positions from cached Transform pointers (1 invoke per bone)
     ScreenPos scr[BONE_COUNT] = {};
     unity::Vector3 world_pos[BONE_COUNT] = {};
-    bool bone_visible[BONE_COUNT] = {};  // true = not occluded by walls
+    bool bones_valid[BONE_COUNT] = {};
+    bool bone_visible[BONE_COUNT] = {};
+
     for (int i = 0; i < BONE_COUNT; i++) {
-        if (!bones[i]) continue;
-        if (get_transform_position(bones[i], world_pos[i])) {
+        if (!cached->transforms[i]) continue;
+        if (get_transform_position(cached->transforms[i], world_pos[i])) {
             scr[i] = world_to_screen(world_pos[i], screen_w, screen_h);
-            // Visibility check (only for on-screen bones to save perf)
-            if (scr[i].visible && vis_enabled && eye_unity) {
-                bone_visible[i] = visibility::is_visible_unity(*eye_unity, world_pos[i]);
-            } else {
-                bone_visible[i] = true; // no check = assume visible
-            }
+            bones_valid[i] = true;
         }
+    }
+
+    // Visibility: use smart propagation (3 raycasts) instead of per-bone (20)
+    if (vis_enabled && eye_unity) {
+        compute_smart_visibility(*eye_unity, world_pos, bones_valid, bone_visible);
+    } else {
+        // No visibility check requested -- assume all visible
+        for (int i = 0; i < BONE_COUNT; i++)
+            bone_visible[i] = true;
     }
 
     // Draw chain: connect consecutive found bones, color by visibility
@@ -581,7 +786,7 @@ static bool draw_player_skeleton(MonoObject* player_entity,
         int prev = -1;
         for (int i = 0; i < len; i++) {
             int idx = (int)chain[i];
-            if (!bones[idx] || !scr[idx].visible) continue;
+            if (!bones_valid[idx] || !scr[idx].visible) continue;
             if (prev >= 0 && scr[prev].visible) {
                 // Use visible color if either endpoint is visible
                 bool seg_vis = bone_visible[prev] || bone_visible[idx];
@@ -592,20 +797,20 @@ static bool draw_player_skeleton(MonoObject* player_entity,
         }
     };
 
-    // Spine chain: head → neck → chest → mid → lower spine → pelvis
+    // Spine chain: head -> neck -> chest -> mid -> lower spine -> pelvis
     static const BoneId SPINE_CHAIN[] = {
         BONE_HEAD, BONE_NECK, BONE_SPINE2, BONE_SPINE1, BONE_SPINE, BONE_PELVIS
     };
     draw_chain(SPINE_CHAIN, 6);
 
     // Arm attachment point: Neck (clavicles are children of Neck in this skeleton)
-    // Fallback to Spine2 → Spine1 if Neck not found
+    // Fallback to Spine2 -> Spine1 if Neck not found
     BoneId arm_root = BONE_UNKNOWN;
-    if (bones[BONE_NECK])        arm_root = BONE_NECK;
-    else if (bones[BONE_SPINE2]) arm_root = BONE_SPINE2;
-    else if (bones[BONE_SPINE1]) arm_root = BONE_SPINE1;
+    if (bones_valid[BONE_NECK])        arm_root = BONE_NECK;
+    else if (bones_valid[BONE_SPINE2]) arm_root = BONE_SPINE2;
+    else if (bones_valid[BONE_SPINE1]) arm_root = BONE_SPINE1;
 
-    // Arm chains: neck → clavicle → upper arm → forearm → hand
+    // Arm chains: neck -> clavicle -> upper arm -> forearm -> hand
     if (arm_root != BONE_UNKNOWN) {
         BoneId l_arm[] = { arm_root, BONE_L_CLAVICLE, BONE_L_UPPER_ARM, BONE_L_FOREARM, BONE_L_HAND };
         draw_chain(l_arm, 5);
@@ -621,7 +826,7 @@ static bool draw_player_skeleton(MonoObject* player_entity,
 
     // Draw joint dots (colored by visibility)
     for (int i = 0; i < BONE_COUNT; i++) {
-        if (bones[i] && scr[i].visible) {
+        if (bones_valid[i] && scr[i].visible) {
             unity::Color c = bone_visible[i] ? vis_col : occ_col;
             draw_filled_rect(scr[i].x - 2, scr[i].y - 2, 4, 4, c);
         }
@@ -649,34 +854,40 @@ bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
     if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
         !s_skel.PE_get_thirdPersonUnityObjects) return false;
 
-    // Check hasThirdPersonUnityObjects
+    // Try the persistent cache first -- if we have a cached HEAD transform,
+    // we can read its position directly without any hierarchy walk.
+    auto it = s_skeleton_cache.find(player_entity);
+    if (it != s_skeleton_cache.end()) {
+        CachedSkeleton& cached = it->second;
+        // Try the classified head bone
+        if (cached.transforms[BONE_HEAD]) {
+            if (get_transform_position(cached.transforms[BONE_HEAD], out))
+                return true;
+        }
+        // Try the fallback head
+        if (cached.fallback_head) {
+            if (get_transform_position(cached.fallback_head, out))
+                return true;
+        }
+    }
+
+    // Cache miss -- fall back to reading ThirdTran.HeadTransform directly
+    // (this is the cheapest non-cached path: ~4 invokes vs ~120 for hierarchy)
     MonoObject* has_res = invoke_safe(
         s_skel.PE_get_hasThirdPersonUnityObjects, player_entity);
     if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
         return false;
 
-    // Get ThirdPersonUnityObjectsComponent
     MonoObject* tpu = invoke_safe(
         s_skel.PE_get_thirdPersonUnityObjects, player_entity);
     if (!tpu || !s_skel.TPU_ThirdTran) return false;
 
-    // Get ThirdTran
     MonoObject* third_tran = nullptr;
     mono::field_get_value(tpu, s_skel.TPU_ThirdTran, &third_tran);
     if (!third_tran) return false;
 
-    // Resolve ThirdTran fields if not done yet
-    if (!s_skel.fields_resolved && mono::object_get_class) {
-        MonoClass* tt_cls = mono::object_get_class(third_tran);
-        if (tt_cls) {
-            s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
-            s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
-            s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
-            s_skel.fields_resolved = true;
-        }
-    }
+    resolve_third_tran_fields(third_tran);
 
-    // Read HeadTransform (direct bone reference, no hierarchy traversal)
     MonoObject* head_tf = nullptr;
     if (s_skel.TT_HeadTransform)
         mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &head_tf);
@@ -695,80 +906,27 @@ int get_bone_targets(MonoObject* player_entity,
     init_skeleton_cache();
 
     if (!player_entity || !out || max_bones <= 0) return 0;
-    if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
-        !s_skel.PE_get_thirdPersonUnityObjects) return 0;
 
-    // Check hasThirdPersonUnityObjects
-    MonoObject* has_res = invoke_safe(
-        s_skel.PE_get_hasThirdPersonUnityObjects, player_entity);
-    if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res)))
-        return 0;
+    // Get or populate the persistent skeleton cache for this entity.
+    // This avoids the expensive collect_bones() hierarchy walk on every call.
+    CachedSkeleton* cached = get_or_populate_skeleton(player_entity);
+    if (!cached) return 0;
 
-    MonoObject* tpu = invoke_safe(
-        s_skel.PE_get_thirdPersonUnityObjects, player_entity);
-    if (!tpu || !s_skel.TPU_ThirdTran) return 0;
-
-    MonoObject* third_tran = nullptr;
-    mono::field_get_value(tpu, s_skel.TPU_ThirdTran, &third_tran);
-    if (!third_tran) return 0;
-
-    // Resolve fields if needed
-    if (!s_skel.fields_resolved && mono::object_get_class) {
-        MonoClass* tt_cls = mono::object_get_class(third_tran);
-        if (tt_cls) {
-            s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
-            s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
-            s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
-            s_skel.fields_resolved = true;
-        }
-    }
-
-    MonoObject* root_go = nullptr;
-    if (s_skel.TT_RootContainer)
-        mono::field_get_value(third_tran, s_skel.TT_RootContainer, &root_go);
-    if (!root_go) return 0;
-
-    MonoMethod* get_tf = unity::methods().GameObject_get_transform;
-    if (!get_tf) return 0;
-    MonoObject* root_transform = invoke_safe(get_tf, root_go);
-    if (!root_transform) return 0;
-
-    // Collect bones
-    MonoObject* bones[BONE_COUNT] = {};
-    int found = 0;
-    collect_bones(root_transform, bones, 0, 15, found);
-
-    // Fill output with position + visibility
-    int count = 0;
     int limit = (max_bones < BONE_COUNT) ? max_bones : BONE_COUNT;
-    for (int i = 0; i < limit; i++) {
-        out[i].bone_id = i;
-        out[i].valid = false;
-        out[i].visible = false;
-        if (!bones[i]) continue;
 
-        unity::Vector3 pos;
-        if (!get_transform_position(bones[i], pos)) continue;
+    // Handle fallback path (obfuscated bone names -- only head + body)
+    if (cached->found < 3 && cached->has_fallback) {
+        // Initialize all slots as invalid
+        for (int i = 0; i < limit; i++) {
+            out[i].bone_id = i;
+            out[i].valid = false;
+            out[i].visible = false;
+        }
 
-        out[i].world_pos = pos;
-        out[i].valid = true;
-        out[i].visible = visibility::is_visible_unity(eye_unity, pos);
-        count++;
-    }
-
-    // Fallback for models with obfuscated bone names (e.g., pandora_t/ct):
-    // Use ThirdTran.HeadTransform and BodyTransform directly as head + body targets
-    if (count == 0 && third_tran) {
-        MonoObject* head_tf = nullptr;
-        MonoObject* body_tf = nullptr;
-        if (s_skel.TT_HeadTransform)
-            mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &head_tf);
-        if (s_skel.TT_BodyTransform)
-            mono::field_get_value(third_tran, s_skel.TT_BodyTransform, &body_tf);
-
-        if (head_tf && BONE_HEAD < limit) {
+        int count = 0;
+        if (cached->fallback_head && BONE_HEAD < limit) {
             unity::Vector3 pos;
-            if (get_transform_position(head_tf, pos)) {
+            if (get_transform_position(cached->fallback_head, pos)) {
                 out[BONE_HEAD].world_pos = pos;
                 out[BONE_HEAD].valid = true;
                 out[BONE_HEAD].visible = visibility::is_visible_unity(eye_unity, pos);
@@ -776,9 +934,9 @@ int get_bone_targets(MonoObject* player_entity,
                 count++;
             }
         }
-        if (body_tf && BONE_SPINE1 < limit) {
+        if (cached->fallback_body && BONE_SPINE1 < limit) {
             unity::Vector3 pos;
-            if (get_transform_position(body_tf, pos)) {
+            if (get_transform_position(cached->fallback_body, pos)) {
                 out[BONE_SPINE1].world_pos = pos;
                 out[BONE_SPINE1].valid = true;
                 out[BONE_SPINE1].visible = visibility::is_visible_unity(eye_unity, pos);
@@ -786,6 +944,40 @@ int get_bone_targets(MonoObject* player_entity,
                 count++;
             }
         }
+        return count;
+    }
+
+    // Full skeleton path: read positions from cached transforms
+    unity::Vector3 world_pos[BONE_COUNT] = {};
+    bool bones_valid[BONE_COUNT] = {};
+    bool bone_visible[BONE_COUNT] = {};
+
+    int count = 0;
+    for (int i = 0; i < limit; i++) {
+        out[i].bone_id = i;
+        out[i].valid = false;
+        out[i].visible = false;
+        if (!cached->transforms[i]) continue;
+
+        unity::Vector3 pos;
+        if (!get_transform_position(cached->transforms[i], pos)) continue;
+
+        world_pos[i] = pos;
+        bones_valid[i] = true;
+        out[i].world_pos = pos;
+        out[i].valid = true;
+        count++;
+    }
+
+    if (count == 0) return 0;
+
+    // Smart visibility: 3 raycasts instead of 20
+    compute_smart_visibility(eye_unity, world_pos, bones_valid, bone_visible);
+
+    // Copy visibility results to output
+    for (int i = 0; i < limit; i++) {
+        if (out[i].valid)
+            out[i].visible = bone_visible[i];
     }
 
     return count;
@@ -847,15 +1039,7 @@ std::string dump_per_player_skeleton() {
         }
 
         // Resolve fields if needed
-        if (!s_skel.fields_resolved && mono::object_get_class) {
-            MonoClass* tt_cls = mono::object_get_class(third_tran);
-            if (tt_cls) {
-                s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
-                s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
-                s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
-                s_skel.fields_resolved = true;
-            }
-        }
+        resolve_third_tran_fields(third_tran);
 
         MonoObject* root_go = nullptr;
         if (s_skel.TT_RootContainer)
@@ -870,12 +1054,22 @@ std::string dump_per_player_skeleton() {
         MonoObject* root_tf = invoke_safe(get_tf, root_go);
         if (!root_tf) { out += "  (root transform null)\n"; continue; }
 
-        // Collect bones
+        // Collect bones (dump always does a fresh walk for accuracy)
         MonoObject* bones[BONE_COUNT] = {};
         int found = 0;
         collect_bones(root_tf, bones, 0, 15, found);
 
         snprintf(buf, sizeof(buf), "  bones found: %d/%d\n", found, BONE_COUNT);
+        out += buf;
+
+        // Show cache status
+        auto cache_it = s_skeleton_cache.find(p._raw_entity);
+        if (cache_it != s_skeleton_cache.end()) {
+            snprintf(buf, sizeof(buf), "  cached: yes (frame=%u validated=%u)\n",
+                cache_it->second.frame_cached, cache_it->second.frame_validated);
+        } else {
+            snprintf(buf, sizeof(buf), "  cached: no\n");
+        }
         out += buf;
 
         // List found bones
@@ -949,6 +1143,13 @@ void draw() {
     // Increment frame counter and mark debug as "in progress" so that if we
     // throw an exception, the stale string will be obviously different.
     s_esp_frame++;
+    s_cache_frame++;  // advance skeleton cache frame counter
+
+    // Clear the skeleton cache every frame.  Entity pointers may be recycled by
+    // Entitas (same MonoObject* reused for a different player) which would cause
+    // the cache to return the wrong player's bone transforms.  Within-frame
+    // caching still works (ESP draw + aimbot share the same frame's skeleton).
+    s_skeleton_cache.clear();
 
     // Create texture on first draw (main thread context)
     ensure_texture();
@@ -966,11 +1167,13 @@ void draw() {
 
     // If camera is not available (scene transition), skip rendering but don't abort
     if (!s_frame_camera) {
+        // Scene change detected -- clear the skeleton cache since entities are gone
+        clear_skeleton_cache();
         s_esp_debug = "ESP: cam=NULL (scene loading?)";
         return;
     }
 
-    // If texture is missing, try again but don't abort — text labels still work
+    // If texture is missing, try again but don't abort -- text labels still work
     if (!s_white_tex) {
         s_esp_debug = "ESP: tex=NULL (recreating)";
         return;
@@ -979,8 +1182,8 @@ void draw() {
     // Save original GUI color so we can restore it when we are done
     unity::Color orig_color = gui::get_color();
 
-    // ------ Fetch all player data from player_info module (single pass) ------
-    std::vector<player_info::PlayerData> players = player_info::read_all_players();
+    // ------ Fetch all player data via frame_cache (shared with aimbot) ------
+    const auto& players = frame_cache::get_players();
 
     // Find local player's team_id from the already-fetched list (no extra Mono calls)
     int local_team = -1;
@@ -990,6 +1193,12 @@ void draw() {
 
     int w2s_ok = 0, w2s_fail = 0, drawn = 0;
     float first_sx = 0, first_sy = 0;
+
+    // Save original font settings ONCE outside the loop (not per-player)
+    int orig_font_size = gui::get_label_font_size();
+    int orig_alignment = gui::get_label_alignment();
+    gui::set_label_font_size(14);
+    gui::set_label_alignment(gui::text_anchor::UpperCenter);
 
     for (const auto& p : players) {
         // Skip invalid, local, or dead players
@@ -1079,12 +1288,6 @@ void draw() {
         float text_x = box_cx - text_w * 0.5f;
         float text_h = 22.0f;  // enough height for larger font
 
-        // Set larger font and center alignment for ESP text
-        int orig_font_size = gui::get_label_font_size();
-        int orig_alignment = gui::get_label_alignment();
-        gui::set_label_font_size(14);
-        gui::set_label_alignment(gui::text_anchor::UpperCenter);
-
         // --- (d) Player name above box (shadow text) ---
         draw_text_shadow(text_x, box_y - text_h - 2.0f, text_w, text_h, p.name.c_str());
 
@@ -1099,12 +1302,12 @@ void draw() {
                 p.weapon_name.c_str());
         }
 
-        // Restore original font settings
-        gui::set_label_font_size(orig_font_size);
-        gui::set_label_alignment(orig_alignment);
-
         drawn++;
     }
+
+    // Restore original font settings (saved before the loop)
+    gui::set_label_font_size(orig_font_size);
+    gui::set_label_alignment(orig_alignment);
 
     // --------------- Skeleton ESP pass ---------------
     // Reuses the same player data from box ESP (no second entity enumeration).
@@ -1119,9 +1322,9 @@ void draw() {
     bool have_eye = false;
     for (const auto& p : players) {
         if (p.is_local && p.valid) {
-            // SSJJ pos → Unity: SSJJ(x,y,z) → Unity(-y, z, x)
+            // SSJJ pos -> Unity: SSJJ(x,y,z) -> Unity(-y, z, x)
             eye_unity.x = -p.position.y;
-            eye_unity.y =  p.position.z + 150.0f; // eye height above feet (SSJJ Z → Unity Y)
+            eye_unity.y =  p.position.z + 150.0f; // eye height above feet (SSJJ Z -> Unity Y)
             eye_unity.z =  p.position.x;
             have_eye = true;
             break;
@@ -1156,8 +1359,9 @@ void draw() {
     }
     s_last_draw_tick = now_tick;
 
-    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d gap=%lums #%u",
-        w2s_ok, w2s_fail, drawn, skel_drawn, s_max_gap_ms, s_esp_frame);
+    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d cache=%zu gap=%lums #%u",
+        w2s_ok, w2s_fail, drawn, skel_drawn,
+        s_skeleton_cache.size(), s_max_gap_ms, s_esp_frame);
     s_esp_debug = dbg;
     if (!s_bone_debug.empty()) {
         s_esp_debug += "\nBones:\n";
@@ -1177,7 +1381,7 @@ void set_skeleton_enabled(bool enabled) { s_skeleton_enabled = enabled; }
 bool is_skeleton_enabled() { return s_skeleton_enabled; }
 
 // ---------------------------------------------------------------------------
-// Shutdown -- free GC handle and null texture
+// Shutdown -- free GC handle and null texture, clear skeleton cache
 // ---------------------------------------------------------------------------
 void shutdown() {
     if (s_tex_gc_handle) {
@@ -1185,6 +1389,7 @@ void shutdown() {
         s_tex_gc_handle = 0;
     }
     s_white_tex = nullptr;
+    clear_skeleton_cache();
 }
 
 } // namespace esp

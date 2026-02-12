@@ -1,4 +1,5 @@
 #include "aimbot.h"
+#include "frame_cache.h"
 #include "player_info.h"
 #include "esp.h"
 #include "visibility.h"
@@ -268,8 +269,8 @@ static void apply_aimbot() {
     // Get InputComponent (source of truth for aim direction)
     MonoObject* input = get_input_component();
 
-    // Read local player data for position and team
-    player_info::PlayerData local_data = player_info::read_local_player();
+    // Read local player data from frame cache (shared with ESP, no duplicate read)
+    const auto& local_data = frame_cache::get_local_player();
     if (!local_data.valid || local_data.is_dead) { s_debug = "AIM: dead"; return; }
 
     // Current view angles -- read from InputComponent if available, else OrientationComponent
@@ -284,8 +285,8 @@ static void apply_aimbot() {
     float punch_yaw, punch_pitch;
     read_punch(pe, punch_yaw, punch_pitch);
 
-    // Enumerate all enemies
-    auto players = player_info::read_all_players();
+    // Enumerate all enemies from frame cache (shared with ESP)
+    const auto& players = frame_cache::get_players();
 
     // Local eye position in SSJJ coords
     unity::Vector3 eye = local_data.position;
@@ -350,14 +351,12 @@ static void apply_aimbot() {
         if (local_data.team_id >= 0 && p.team_id == local_data.team_id)
             continue;
 
-        // Get per-bone visibility data
-        esp::BoneTarget bone_targets[20] = {};
-        int bone_count = 0;
-        if (p._raw_entity) {
-            bone_count = esp::get_bone_targets(p._raw_entity, eye_unity,
-                                                bone_targets, 20);
-        }
-        if (bone_count <= 0) continue; // no bone data → skip
+        // Get per-bone visibility data from frame cache (shared with ESP)
+        if (!p._raw_entity) continue;
+        const auto& cached = frame_cache::get_bone_data(p._raw_entity, eye_unity);
+        if (cached.count <= 0) continue; // no bone data -> skip
+        const esp::BoneTarget* bone_targets = cached.bones;
+        int bone_count = cached.count;
 
         // Find the best VISIBLE bone for this player:
         //   Head visible → pick head immediately

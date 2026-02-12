@@ -12,6 +12,7 @@
 #include "game/aimbot.h"
 #include "game/visibility.h"
 #include "game/anticheat.h"
+#include "game/frame_cache.h"
 
 static DWORD WINAPI init_thread(LPVOID param)
 {
@@ -112,6 +113,7 @@ static DWORD WINAPI init_thread(LPVOID param)
 
     // Cleanup
     payload::shutdown();
+    frame_cache::shutdown();
     anticheat::shutdown();
     visibility::shutdown();
     aimbot::shutdown();

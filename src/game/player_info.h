@@ -10,6 +10,14 @@ typedef struct _MonoObject MonoObject;
 
 namespace player_info {
 
+// ReadMode controls which fields are populated per entity.
+// Fewer fields = fewer mono::runtime_invoke calls = better perf.
+enum class ReadMode {
+    Full,       // Read everything (for dump/diagnostics)
+    ESP,        // Read: name, is_dead, team_id, hp, max_hp, position, entity_id, weapon
+    Minimal     // Read: is_dead, team_id, position, entity_id only (for quick checks)
+};
+
 struct PlayerData {
     bool valid = false;
     bool is_local = false;
@@ -58,7 +66,8 @@ bool initialize();
 PlayerData read_local_player();
 
 // Read all players in the match. Returns empty vector if not in a match.
-std::vector<PlayerData> read_all_players();
+// Default ReadMode::Full preserves backward compatibility.
+std::vector<PlayerData> read_all_players(ReadMode mode = ReadMode::Full);
 
 // Debug info string (for diagnosing issues)
 const std::string& get_debug_info();

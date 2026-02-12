@@ -8,6 +8,43 @@
 namespace player_info {
 
 // ---------------------------------------------------------------------------
+// Entitas component indices (from PlayerEntity generated code)
+// ---------------------------------------------------------------------------
+namespace comp_idx {
+    constexpr int ENTITY_ID       = 2;
+    constexpr int LIFE            = 4;
+    constexpr int ORIENTATION     = 6;
+    constexpr int BASIC_INFO      = 17;
+    constexpr int CURRENT_WEAPON  = 23;
+    constexpr int CURR_KILL       = 24;
+    constexpr int MY_PLAYER       = 43;
+    constexpr int FPOS            = 51;
+    constexpr int MOVE            = 59;
+    constexpr int TEAM_NAME       = 81;
+}
+
+// ---------------------------------------------------------------------------
+// mono_array_get macro -- direct memory access into MonoArray data.
+//
+// MonoArray layout (64-bit Mono):
+//   MonoObject header  : 16 bytes (vtable* + sync*)
+//   MonoArrayBounds*   :  8 bytes (bounds pointer, null for 1D arrays)
+//   uintptr_t max_len  :  8 bytes (max_length)
+//   T data[0]          : array elements start at offset 32
+//
+// This is equivalent to the Mono C API's mono_array_get macro but we define
+// it locally to avoid a header dependency.  For reference arrays (MonoObject*)
+// each element is a pointer.
+// ---------------------------------------------------------------------------
+#define MONO_ARRAY_DATA_OFFSET 32
+
+#define mono_array_get(arr, type, index) \
+    (*(type*)(((char*)(arr)) + MONO_ARRAY_DATA_OFFSET + sizeof(type) * (index)))
+
+#define mono_array_length(arr) \
+    (*(uintptr_t*)(((char*)(arr)) + 24))
+
+// ---------------------------------------------------------------------------
 // Cached class handles
 // ---------------------------------------------------------------------------
 static struct {
@@ -24,6 +61,7 @@ static struct {
     MonoClass* CurrKillComponent   = nullptr;  // Assets.Sources.Components.Player
     MonoClass* FposComponent       = nullptr;  // Assets.Sources.Components.Player
     MonoClass* PlayerEntityData    = nullptr;  // NetData (SSJJ.Contract)
+    MonoClass* Entity              = nullptr;  // Entitas.Entity (base class)
 } s_classes;
 
 // ---------------------------------------------------------------------------
@@ -37,7 +75,8 @@ static struct {
     // PlayerContext
     MonoMethod* PlayerContext_get_myPlayerEntity = nullptr;
 
-    // PlayerEntity component getters
+    // PlayerEntity component getters (kept as fallback; primary path uses
+    // direct component array access via s_fields.Entity_components)
     MonoMethod* PlayerEntity_HasComponent        = nullptr;
     MonoMethod* PlayerEntity_get_basicInfo       = nullptr;
     MonoMethod* PlayerEntity_get_orientation      = nullptr;
@@ -73,6 +112,9 @@ static struct {
 // Cached field handles
 // ---------------------------------------------------------------------------
 static struct {
+    // Entitas.Entity base class -- the key optimization field
+    MonoClassField* Entity_components = nullptr;  // _components : IComponent[]
+
     // BasicInfoComponent
     MonoClassField* BasicInfo_Current = nullptr;  // -> PlayerEntityData
 
@@ -192,6 +234,28 @@ static void read_field_object(MonoObject* obj, MonoClassField* field, MonoObject
 }
 
 // ---------------------------------------------------------------------------
+// Direct component array access
+// ---------------------------------------------------------------------------
+// Read the _components array from an entity object.  Returns nullptr if the
+// field has not been resolved or the entity is null.
+static MonoArray* get_components_array(MonoObject* entity) {
+    if (!entity || !s_fields.Entity_components) return nullptr;
+    MonoArray* arr = nullptr;
+    mono::field_get_value(entity, s_fields.Entity_components, &arr);
+    return arr;
+}
+
+// Read a component from the entity's _components array by index.
+// Returns nullptr if the array is null, index is out of bounds, or the
+// component slot is empty (entity doesn't have that component).
+static MonoObject* get_component_direct(MonoArray* components, int index) {
+    if (!components) return nullptr;
+    uintptr_t len = mono_array_length(components);
+    if (index < 0 || static_cast<uintptr_t>(index) >= len) return nullptr;
+    return mono_array_get(components, MonoObject*, index);
+}
+
+// ---------------------------------------------------------------------------
 // Initialize
 // ---------------------------------------------------------------------------
 bool initialize() {
@@ -223,6 +287,24 @@ bool initialize() {
         return false;
     }
 
+    // --- Resolve Entitas.Entity base class for _components field ---
+    // Walk up from PlayerEntity to find the Entity base class that has _components.
+    {
+        MonoClass* cls = s_classes.PlayerEntity;
+        while (cls && mono::class_get_parent) {
+            const char* name = mono::class_get_name ? mono::class_get_name(cls) : nullptr;
+            if (name && strcmp(name, "Entity") == 0) {
+                s_classes.Entity = cls;
+                break;
+            }
+            cls = mono::class_get_parent(cls);
+        }
+        // Resolve _components field from the Entity base class
+        if (s_classes.Entity && mono::class_get_field_from_name) {
+            s_fields.Entity_components = mono::class_get_field_from_name(s_classes.Entity, "_components");
+        }
+    }
+
     // --- Resolve methods ---
     s_methods.Contexts_get_sharedInstance = mono::class_get_method_from_name(s_classes.Contexts, "get_sharedInstance", 0);
     s_methods.Contexts_get_player        = mono::class_get_method_from_name(s_classes.Contexts, "get_player", 0);
@@ -231,6 +313,7 @@ bool initialize() {
 
     if (s_classes.PlayerEntity) {
         s_methods.PlayerEntity_HasComponent = mono::class_get_method_from_name(s_classes.PlayerEntity, "HasComponent", 1);
+        // Keep method handles as fallback in case direct array access fails
         s_methods.PlayerEntity_get_basicInfo    = mono::class_get_method_from_name(s_classes.PlayerEntity, "get_basicInfo", 0);
         s_methods.PlayerEntity_get_orientation   = mono::class_get_method_from_name(s_classes.PlayerEntity, "get_orientation", 0);
         s_methods.PlayerEntity_get_currentWeapon = mono::class_get_method_from_name(s_classes.PlayerEntity, "get_currentWeapon", 0);
@@ -312,83 +395,151 @@ bool initialize() {
 
 // ---------------------------------------------------------------------------
 // Read a single player entity's data (shared logic)
+//
+// Optimization: instead of calling ~10 PlayerEntity.get_XYZ() property
+// getters (each a mono::runtime_invoke), we read the entity's _components
+// array directly via mono::field_get_value + pointer arithmetic.  This
+// replaces ~10 invokes with ~1 field read + fast in-memory array accesses.
+//
+// The ReadMode parameter controls which components are read:
+//   Full    - all components (17 invokes -> ~5 invokes with optimization)
+//   ESP     - name, dead, team, hp, position, entity_id, weapon (~4 invokes)
+//   Minimal - dead, team, position, entity_id (~3 invokes)
 // ---------------------------------------------------------------------------
-static PlayerData read_entity(MonoObject* player_entity) {
+static PlayerData read_entity(MonoObject* player_entity, ReadMode mode) {
     PlayerData data;
     if (!player_entity) return data;
     data.valid = true;
 
-    // --- BasicInfoComponent ---
-    MonoObject* basic_info = invoke(s_methods.PlayerEntity_get_basicInfo, player_entity);
-    if (basic_info) {
-        MonoObject* name_obj = invoke(s_methods.BasicInfo_get_PlayerName, basic_info);
-        if (name_obj) {
-            data.name = read_mono_string(reinterpret_cast<MonoString*>(name_obj));
-        }
-        data.is_dead = unbox_bool(invoke(s_methods.BasicInfo_get_IsDead, basic_info));
-        data.cid = unbox_int64(invoke(s_methods.BasicInfo_get_Cid, basic_info));
+    // ---- Try direct component array access (fast path) ----
+    // Reads _components field from Entity base class, then indexes into it
+    // directly.  Each component is a MonoObject* in a managed array.
+    // This replaces ~10 mono::runtime_invoke calls with 1 field_get_value
+    // + N pointer-arithmetic array reads (zero invoke overhead).
+    MonoArray* components = get_components_array(player_entity);
 
+    // --- BasicInfoComponent (invoke cost: 3-6 depending on mode) ---
+    // Always needed: provides is_dead, team_id.  ESP/Full also reads name, hp.
+    MonoObject* basic_info = components
+        ? get_component_direct(components, comp_idx::BASIC_INFO)
+        : invoke(s_methods.PlayerEntity_get_basicInfo, player_entity);
+
+    if (basic_info) {
+        // is_dead (1 invoke) -- always needed
+        data.is_dead = unbox_bool(invoke(s_methods.BasicInfo_get_IsDead, basic_info));
+
+        // EntityData -> team_id, hp, max_hp (field read + 1-3 invokes)
         MonoObject* entity_data = nullptr;
         read_field_object(basic_info, s_fields.BasicInfo_Current, entity_data);
         if (entity_data) {
-            data.hp      = unbox_float(invoke(s_methods.EntityData_get_Hp, entity_data));
-            data.max_hp  = unbox_float(invoke(s_methods.EntityData_get_MaxHp, entity_data));
+            // team_id (1 invoke) -- always needed
             data.team_id = unbox_int(invoke(s_methods.EntityData_get_Team, entity_data));
+
+            if (mode != ReadMode::Minimal) {
+                // hp, max_hp (2 invokes) -- ESP and Full
+                data.hp      = unbox_float(invoke(s_methods.EntityData_get_Hp, entity_data));
+                data.max_hp  = unbox_float(invoke(s_methods.EntityData_get_MaxHp, entity_data));
+            }
+        }
+
+        if (mode != ReadMode::Minimal) {
+            // name (1 invoke) -- ESP and Full
+            MonoObject* name_obj = invoke(s_methods.BasicInfo_get_PlayerName, basic_info);
+            if (name_obj) {
+                data.name = read_mono_string(reinterpret_cast<MonoString*>(name_obj));
+            }
+        }
+
+        if (mode == ReadMode::Full) {
+            // cid (1 invoke) -- Full only
+            data.cid = unbox_int64(invoke(s_methods.BasicInfo_get_Cid, basic_info));
         }
     }
 
-    // --- Orientation ---
-    MonoObject* orientation = invoke(s_methods.PlayerEntity_get_orientation, player_entity);
-    if (orientation) {
-        read_field_float(orientation, s_fields.Orientation_Yaw, data.yaw);
-        read_field_float(orientation, s_fields.Orientation_Pitch, data.pitch);
+    // --- EntityId (0 invokes -- direct field read) ---
+    // Needed by all modes (ESP for display, Minimal for aimbot entity tracking)
+    MonoObject* entity_id_comp = components
+        ? get_component_direct(components, comp_idx::ENTITY_ID)
+        : invoke(s_methods.PlayerEntity_get_entityId, player_entity);
+    if (entity_id_comp) {
+        read_field_int(entity_id_comp, s_fields.EntityId_Value, data.entity_id);
     }
 
-    // --- Current Weapon ---
-    MonoObject* weapon = invoke(s_methods.PlayerEntity_get_currentWeapon, player_entity);
-    if (weapon) {
-        data.weapon_name = read_field_string(weapon, s_fields.Weapon_Name);
-        read_field_int(weapon, s_fields.Weapon_Weapon, data.weapon_id);
-        read_field_int(weapon, s_fields.Weapon_Level, data.weapon_level);
-    }
-
-    // --- Move ---
-    MonoObject* move = invoke(s_methods.PlayerEntity_get_move, player_entity);
-    if (move) {
-        read_field_vector3(move, s_fields.Move_Velocity, data.velocity);
-        read_field_bool(move, s_fields.Move_OnGround, data.on_ground);
-        read_field_bool(move, s_fields.Move_Moving, data.moving);
-        read_field_float(move, s_fields.Move_Stamina, data.stamina);
-    }
-
-    // --- Life ---
-    MonoObject* life = invoke(s_methods.PlayerEntity_get_life, player_entity);
+    // --- Life (0 invokes -- direct field read) ---
+    // Double-check is_dead from LifeComponent (BasicInfo.IsDead may lag)
+    MonoObject* life = components
+        ? get_component_direct(components, comp_idx::LIFE)
+        : invoke(s_methods.PlayerEntity_get_life, player_entity);
     if (life) {
         read_field_bool(life, s_fields.Life_IsDead, data.is_dead);
     }
 
-    // --- EntityId ---
-    MonoObject* entity_id = invoke(s_methods.PlayerEntity_get_entityId, player_entity);
-    if (entity_id) {
-        read_field_int(entity_id, s_fields.EntityId_Value, data.entity_id);
+    // --- Orientation (0 invokes -- direct field reads) ---
+    // Full only -- aimbot reads orientation separately via its own cached handles
+    if (mode == ReadMode::Full) {
+        MonoObject* orientation = components
+            ? get_component_direct(components, comp_idx::ORIENTATION)
+            : invoke(s_methods.PlayerEntity_get_orientation, player_entity);
+        if (orientation) {
+            read_field_float(orientation, s_fields.Orientation_Yaw, data.yaw);
+            read_field_float(orientation, s_fields.Orientation_Pitch, data.pitch);
+        }
     }
 
-    // --- TeamName ---
-    MonoObject* team_name = invoke(s_methods.PlayerEntity_get_teamName, player_entity);
-    if (team_name) {
-        data.team_name = read_field_string(team_name, s_fields.TeamName_TeamName);
+    // --- Current Weapon (0 invokes -- direct field reads) ---
+    // ESP and Full
+    if (mode != ReadMode::Minimal) {
+        MonoObject* weapon = components
+            ? get_component_direct(components, comp_idx::CURRENT_WEAPON)
+            : invoke(s_methods.PlayerEntity_get_currentWeapon, player_entity);
+        if (weapon) {
+            data.weapon_name = read_field_string(weapon, s_fields.Weapon_Name);
+            read_field_int(weapon, s_fields.Weapon_Weapon, data.weapon_id);
+            read_field_int(weapon, s_fields.Weapon_Level, data.weapon_level);
+        }
     }
 
-    // --- CurrKill ---
-    MonoObject* curr_kill = invoke(s_methods.PlayerEntity_get_currKill, player_entity);
-    if (curr_kill) {
-        read_field_int(curr_kill, s_fields.CurrKill_Count, data.kill_count);
+    // --- Move (0 invokes -- direct field reads) ---
+    // Full only
+    if (mode == ReadMode::Full) {
+        MonoObject* move = components
+            ? get_component_direct(components, comp_idx::MOVE)
+            : invoke(s_methods.PlayerEntity_get_move, player_entity);
+        if (move) {
+            read_field_vector3(move, s_fields.Move_Velocity, data.velocity);
+            read_field_bool(move, s_fields.Move_OnGround, data.on_ground);
+            read_field_bool(move, s_fields.Move_Moving, data.moving);
+            read_field_float(move, s_fields.Move_Stamina, data.stamina);
+        }
     }
 
-    // --- Position ---
-    // Prefer GetCompenstatePos which properly decrypts (undoes Seed scaling)
-    // Falls back to raw Gp() if GetCompenstatePos is not available
-    MonoObject* fpos = invoke(s_methods.PlayerEntity_get_fpos, player_entity);
+    // --- TeamName (0 invokes -- direct field read) ---
+    // Full only -- team_id from EntityData is sufficient for ESP/Minimal
+    if (mode == ReadMode::Full) {
+        MonoObject* team_name = components
+            ? get_component_direct(components, comp_idx::TEAM_NAME)
+            : invoke(s_methods.PlayerEntity_get_teamName, player_entity);
+        if (team_name) {
+            data.team_name = read_field_string(team_name, s_fields.TeamName_TeamName);
+        }
+    }
+
+    // --- CurrKill (0 invokes -- direct field read) ---
+    // Full only
+    if (mode == ReadMode::Full) {
+        MonoObject* curr_kill = components
+            ? get_component_direct(components, comp_idx::CURR_KILL)
+            : invoke(s_methods.PlayerEntity_get_currKill, player_entity);
+        if (curr_kill) {
+            read_field_int(curr_kill, s_fields.CurrKill_Count, data.kill_count);
+        }
+    }
+
+    // --- Position (2 invokes: Change.GetPosIndex + GetCompenstatePos) ---
+    // Always needed by all modes
+    MonoObject* fpos = components
+        ? get_component_direct(components, comp_idx::FPOS)
+        : invoke(s_methods.PlayerEntity_get_fpos, player_entity);
     bool got_pos = false;
 
     if (fpos && s_methods.PlayerEntity_GetCompenstatePos && s_fields.Fpos_Change) {
@@ -439,7 +590,7 @@ PlayerData read_local_player() {
     if (!player_ctx) return {};
 
     MonoObject* player_entity = invoke(s_methods.PlayerContext_get_myPlayerEntity, player_ctx);
-    PlayerData data = read_entity(player_entity);
+    PlayerData data = read_entity(player_entity, ReadMode::Full);
     data.is_local = true;
     data._raw_entity = player_entity;
     return data;
@@ -448,7 +599,7 @@ PlayerData read_local_player() {
 // ---------------------------------------------------------------------------
 // Read all players in the match
 // ---------------------------------------------------------------------------
-std::vector<PlayerData> read_all_players() {
+std::vector<PlayerData> read_all_players(ReadMode mode) {
     std::vector<PlayerData> result;
     char dbg[512];
 
@@ -461,10 +612,14 @@ std::vector<PlayerData> read_all_players() {
     // Get myPlayerEntity pointer for is_local detection (pointer comparison)
     MonoObject* my_player_entity = invoke(s_methods.PlayerContext_get_myPlayerEntity, player_ctx);
 
-    // Also read local player name as fallback for is_local detection
+    // Read local player name as fallback for is_local detection.
+    // Use direct array access if available to avoid extra invokes.
     std::string local_name;
     if (my_player_entity) {
-        MonoObject* local_bi = invoke(s_methods.PlayerEntity_get_basicInfo, my_player_entity);
+        MonoArray* local_comps = get_components_array(my_player_entity);
+        MonoObject* local_bi = local_comps
+            ? get_component_direct(local_comps, comp_idx::BASIC_INFO)
+            : invoke(s_methods.PlayerEntity_get_basicInfo, my_player_entity);
         if (local_bi) {
             MonoObject* name_obj = invoke(s_methods.BasicInfo_get_PlayerName, local_bi);
             if (name_obj) local_name = read_mono_string(reinterpret_cast<MonoString*>(name_obj));
@@ -540,9 +695,6 @@ std::vector<PlayerData> read_all_players() {
         return result;
     }
 
-    // Component indices for HasComponent
-    constexpr int IDX_BASIC_INFO = 17;
-    constexpr int IDX_MY_PLAYER  = 43;
     int processed = 0, skipped = 0;
 
     for (int i = 0; i < count; i++) {
@@ -550,27 +702,39 @@ std::vector<PlayerData> read_all_players() {
         MonoObject* entity = invoke(s_list_get_item, entity_list, idx_args);
         if (!entity) continue;
 
-        // Resolve HasComponent dynamically from the entity's runtime class
-        if (!s_entity_has_comp && mono::object_get_class) {
-            MonoClass* ent_cls = mono::object_get_class(entity);
-            if (ent_cls) {
-                s_entity_has_comp = mono::class_get_method_from_name(ent_cls, "HasComponent", 1);
+        // --- Check if entity has BasicInfo component ---
+        // Optimization: use direct component array access instead of
+        // calling HasComponent(17) via runtime_invoke.  If _components
+        // field is resolved, this is a field read + pointer check (0 invokes).
+        // Falls back to HasComponent invoke if direct access unavailable.
+        MonoArray* ent_components = get_components_array(entity);
+        bool has_basic_info = false;
+
+        if (ent_components) {
+            // Fast path: direct null check on array element (0 invokes)
+            has_basic_info = (get_component_direct(ent_components, comp_idx::BASIC_INFO) != nullptr);
+        } else {
+            // Fallback: invoke HasComponent (1 invoke)
+            if (!s_entity_has_comp && mono::object_get_class) {
+                MonoClass* ent_cls = mono::object_get_class(entity);
+                if (ent_cls) {
+                    s_entity_has_comp = mono::class_get_method_from_name(ent_cls, "HasComponent", 1);
+                }
+                if (!s_entity_has_comp) {
+                    s_entity_has_comp = s_methods.PlayerEntity_HasComponent;
+                }
             }
-            // Fallback: use pre-resolved method from PlayerEntity class
-            if (!s_entity_has_comp) {
-                s_entity_has_comp = s_methods.PlayerEntity_HasComponent;
+            if (s_entity_has_comp) {
+                int bi = comp_idx::BASIC_INFO;
+                void* bi_args[1] = { &bi };
+                MonoObject* has_res = invoke(s_entity_has_comp, entity, bi_args);
+                has_basic_info = unbox_bool(has_res);
             }
         }
 
-        // Check if entity has BasicInfo component
-        if (s_entity_has_comp) {
-            int bi = IDX_BASIC_INFO;
-            void* bi_args[1] = { &bi };
-            MonoObject* has_res = invoke(s_entity_has_comp, entity, bi_args);
-            if (!unbox_bool(has_res)) { skipped++; continue; }
-        }
+        if (!has_basic_info) { skipped++; continue; }
 
-        PlayerData data = read_entity(entity);
+        PlayerData data = read_entity(entity, mode);
         data._raw_entity = entity;
 
         // Check if this is local player:
@@ -582,9 +746,14 @@ std::vector<PlayerData> read_all_players() {
         else if (!local_name.empty() && data.name == local_name) {
             data.is_local = true;
         }
-        // Method 3: HasComponent(MyPlayer) fallback
+        // Method 3: HasComponent(MyPlayer) check via direct array access
+        else if (ent_components) {
+            // Fast path: direct null check (0 invokes)
+            data.is_local = (get_component_direct(ent_components, comp_idx::MY_PLAYER) != nullptr);
+        }
+        // Method 4: HasComponent(MyPlayer) invoke fallback
         else if (s_entity_has_comp) {
-            int mp = IDX_MY_PLAYER;
+            int mp = comp_idx::MY_PLAYER;
             void* mp_args[1] = { &mp };
             MonoObject* is_local_res = invoke(s_entity_has_comp, entity, mp_args);
             data.is_local = unbox_bool(is_local_res);
@@ -594,8 +763,11 @@ std::vector<PlayerData> read_all_players() {
         processed++;
     }
 
-    snprintf(dbg, sizeof(dbg), "OK ctx=%d list=%d proc=%d skip=%d hasComp=%p",
-        ctx_count, count, processed, skipped, (void*)s_entity_has_comp);
+    const char* mode_str = (mode == ReadMode::Full) ? "full" :
+                           (mode == ReadMode::ESP)  ? "esp"  : "min";
+    snprintf(dbg, sizeof(dbg), "OK ctx=%d list=%d proc=%d skip=%d mode=%s comp=%s",
+        ctx_count, count, processed, skipped, mode_str,
+        s_fields.Entity_components ? "direct" : "invoke");
     s_debug_info = dbg;
     return result;
 }
