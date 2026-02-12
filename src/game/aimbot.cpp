@@ -40,12 +40,12 @@ static bool        s_enabled = true;
 static bool        s_silent  = true;     // silent mode on by default
 static std::string s_debug;
 
-// Silent-mode mouse tracking state
+// Silent-mode state
 static bool   s_tracking           = false; // actively tracking real mouse
-static float  s_real_yaw           = 0.0f;  // accumulated real mouse yaw
-static float  s_real_pitch         = 0.0f;  // accumulated real mouse pitch
-static double s_last_written_yaw   = 0.0;   // last TempYaw we wrote (double precision)
-static double s_last_written_pitch = 0.0;   // last TempPitch we wrote
+static float  s_real_yaw           = 0.0f;  // accumulated real mouse yaw (SSJJ)
+static float  s_real_pitch         = 0.0f;  // accumulated real mouse pitch (SSJJ)
+static float  s_prev_aim_yaw      = 0.0f;  // last SSJJ yaw written to InputComponent
+static float  s_prev_aim_pitch    = 0.0f;  // last SSJJ pitch written to InputComponent
 
 // Camera euler calibration (SSJJ angles → Unity camera euler mapping)
 // Mapping: euler.y = -ssjj_yaw + offset_y,  euler.x = -ssjj_pitch + offset_x
@@ -487,77 +487,71 @@ static void apply_aimbot() {
     float aim_yaw   = found ? normalize_angle(best_yaw   - 2.0f * punch_yaw)   : 0.0f;
     float aim_pitch = found ? normalize_angle(best_pitch  - 2.0f * punch_pitch) : 0.0f;
 
-    if (s_silent && input && s_fields.Input_TempYaw) {
+    if (s_silent && input) {
         // ---- Silent mode ----
         // Write target angles to InputComponent (affects next UserCmd → server),
         // but override Camera.main.transform.eulerAngles so the player sees their
-        // real mouse direction.  OrientationComponent alone doesn't control the
-        // camera — the camera Transform is what matters.
-
-        // 0. Read current camera euler (before we change anything)
-        unity::Vector3 cam_euler = {0, 0, 0};
-        bool cam_ok = get_camera_euler(cam_euler);
-
-        // 1. Read current TempYaw/TempPitch — game accumulated mouse delta onto
-        //    whatever we wrote last frame.
-        double cur_temp_yaw, cur_temp_pitch;
-        read_input_temp(input, cur_temp_yaw, cur_temp_pitch);
+        // real mouse direction.
+        //
+        // Mouse delta tracking: use InputComponent.Yaw which contains
+        //   (what we wrote last frame) + mouse_delta_this_frame
+        // This is recoil-free — PunchOrientation only affects the camera/shot
+        // direction, NOT InputComponent.Yaw.  So the delta is pure mouse input.
 
         if (!s_tracking) {
-            // First frame of silent aiming: initialize real direction from
-            // current state (camera hasn't been affected by aimbot yet).
-            float ori_yaw, ori_pitch;
-            read_orientation(pe, ori_yaw, ori_pitch);
-            s_real_yaw   = ori_yaw;
-            s_real_pitch = ori_pitch;
-            s_last_written_yaw   = cur_temp_yaw;
-            s_last_written_pitch = cur_temp_pitch;
+            // First frame: initialize real direction from current InputComponent
+            // (aimbot hasn't written anything yet, so Yaw = real mouse direction).
+            s_real_yaw   = cur_yaw;
+            s_real_pitch = cur_pitch;
+            s_prev_aim_yaw   = cur_yaw;
+            s_prev_aim_pitch = cur_pitch;
 
-            // Calibrate SSJJ → Unity euler mapping:
-            //   euler.y = -ssjj_yaw + offset_y
-            //   euler.x = -ssjj_pitch + offset_x
-            if (cam_ok) {
-                s_euler_offset_y = euler_to_signed(cam_euler.y) + ori_yaw;
-                s_euler_offset_x = euler_to_signed(cam_euler.x) + ori_pitch;
+            // Calibrate camera euler mapping for the override
+            unity::Vector3 cam_euler = {0, 0, 0};
+            if (get_camera_euler(cam_euler)) {
+                s_euler_offset_y = euler_to_signed(cam_euler.y) + cur_yaw;
+                s_euler_offset_x = euler_to_signed(cam_euler.x) + cur_pitch;
                 s_cam_calibrated = true;
             }
 
             s_tracking = true;
         } else {
-            // Extract mouse delta and accumulate into real direction
-            double delta_yaw   = cur_temp_yaw   - s_last_written_yaw;
-            double delta_pitch = cur_temp_pitch  - s_last_written_pitch;
-            s_real_yaw   = normalize_angle(s_real_yaw   + static_cast<float>(delta_yaw));
-            s_real_pitch = normalize_angle(s_real_pitch  + static_cast<float>(delta_pitch));
-            // Clamp pitch to valid range
+            // Extract mouse delta from InputComponent.Yaw (set by game's Update):
+            //   cur_yaw = s_prev_aim_yaw + mouse_delta
+            // No recoil contamination — InputComponent.Yaw is pure aim input.
+            float delta_yaw   = normalize_angle(cur_yaw   - s_prev_aim_yaw);
+            float delta_pitch = normalize_angle(cur_pitch  - s_prev_aim_pitch);
+            s_real_yaw   = normalize_angle(s_real_yaw   + delta_yaw);
+            s_real_pitch = normalize_angle(s_real_pitch  + delta_pitch);
             if (s_real_pitch >  89.0f) s_real_pitch =  89.0f;
             if (s_real_pitch < -89.0f) s_real_pitch = -89.0f;
         }
 
-        // 2. Write angles to InputComponent
+        // 1. Write angles to InputComponent
         if (found) {
             // Target acquired: write target angles → server hit detection
             write_input(input, aim_yaw, aim_pitch);
-            s_last_written_yaw   = static_cast<double>(aim_yaw);
-            s_last_written_pitch = static_cast<double>(aim_pitch);
+            s_prev_aim_yaw   = aim_yaw;
+            s_prev_aim_pitch = aim_pitch;
         } else {
-            // No target (died/out of range): write real angles → smooth control
+            // No target: write real angles → smooth natural control, no snap
             write_input(input, s_real_yaw, s_real_pitch);
-            s_last_written_yaw   = static_cast<double>(s_real_yaw);
-            s_last_written_pitch = static_cast<double>(s_real_pitch);
+            s_prev_aim_yaw   = s_real_yaw;
+            s_prev_aim_pitch = s_real_pitch;
         }
 
-        // 3. Write real to OrientationComponent (affects player model / first-person weapon)
+        // 2. Write real to OrientationComponent (player model / first-person weapon)
         write_orientation(pe, s_real_yaw, s_real_pitch);
 
-        // 4. Override camera Transform to show the real mouse direction
-        //    This is the critical step — the camera's Transform is what the
-        //    renderer actually uses.  We run in LateUpdate, right before render.
+        // 3. Override camera Transform to show the real mouse direction.
+        //    This runs in LateUpdate, right before rendering — final word.
         if (s_cam_calibrated) {
+            unity::Vector3 cam_euler = {0, 0, 0};
+            bool cam_ok = get_camera_euler(cam_euler);
             unity::Vector3 desired;
             desired.x = -s_real_pitch + s_euler_offset_x;
             desired.y = -s_real_yaw   + s_euler_offset_y;
-            desired.z = cam_ok ? cam_euler.z : 0.0f;  // preserve roll
+            desired.z = cam_ok ? cam_euler.z : 0.0f;
             set_camera_euler(desired);
         }
     } else {
