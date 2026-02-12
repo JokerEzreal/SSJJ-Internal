@@ -103,7 +103,9 @@ static void dump_data_to_file() {
     f << "=== FEATURE STATE ===\n";
     f << "ESP Enabled: " << (esp::is_enabled() ? "YES" : "NO") << "\n";
     f << "Skeleton ESP: " << (esp::is_skeleton_enabled() ? "YES" : "NO") << "\n";
-    f << "Aimbot: " << (aimbot::is_enabled() ? "YES" : "NO") << "\n\n";
+    f << "HitBox ESP: " << (esp::is_hitbox_enabled() ? "YES" : "NO") << "\n";
+    f << "Aimbot: " << (aimbot::is_enabled() ? "YES" : "NO")
+      << " (" << (aimbot::is_silent() ? "Silent" : "Normal") << ")\n\n";
 
     // --- Local player ---
     f << "=== LOCAL PLAYER ===\n";
@@ -170,6 +172,11 @@ static void dump_data_to_file() {
     // --- Per-player skeleton summary ---
     f << "=== PER-PLAYER SKELETON ===\n";
     f << esp::dump_per_player_skeleton();
+    f << "\n";
+
+    // --- Per-player hitbox data ---
+    f << "=== PER-PLAYER HITBOXES ===\n";
+    f << esp::dump_per_player_hitboxes();
     f << "\n";
 
     // --- Debug strings ---
@@ -244,6 +251,16 @@ void on_update() {
     // Toggle skeleton ESP
     if (gui::get_key_down(gui::keycode::F3)) {
         esp::set_skeleton_enabled(!esp::is_skeleton_enabled());
+    }
+
+    // Toggle hitbox ESP
+    if (gui::get_key_down(gui::keycode::F4)) {
+        esp::set_hitbox_enabled(!esp::is_hitbox_enabled());
+    }
+
+    // Toggle aimbot silent mode
+    if (gui::get_key_down(gui::keycode::F5)) {
+        aimbot::set_silent(!aimbot::is_silent());
     }
 
     // Refresh player data every ~15 frames
@@ -321,16 +338,29 @@ void on_gui_menu() {
         esp::set_skeleton_enabled(skel_on);
         y += LINE_H + GAP;
 
+        // HitBox ESP toggle
+        bool hb_on = gui::toggle({x, y, w, LINE_H}, esp::is_hitbox_enabled(), "HitBox ESP  [F4]");
+        esp::set_hitbox_enabled(hb_on);
+        y += LINE_H + GAP;
+
         // Aimbot toggle
         bool aim_on = gui::toggle({x, y, w, LINE_H}, aimbot::is_enabled(), "Aimbot  [F2]");
         aimbot::set_enabled(aim_on);
         y += LINE_H + GAP;
 
-        // Aimbot status
-        const char* aim_dbg = aimbot::get_debug_info();
-        if (aim_on && aim_dbg && aim_dbg[0]) {
-            gui::label({x + 20, y, w - 20, LINE_H}, aim_dbg);
+        // Aimbot silent mode toggle
+        if (aim_on) {
+            bool silent = gui::toggle({x + 20, y, w - 20, LINE_H}, aimbot::is_silent(),
+                "Silent Aim  [F5]");
+            aimbot::set_silent(silent);
             y += LINE_H + GAP;
+
+            // Aimbot status
+            const char* aim_dbg = aimbot::get_debug_info();
+            if (aim_dbg && aim_dbg[0]) {
+                gui::label({x + 20, y, w - 20, LINE_H}, aim_dbg);
+                y += LINE_H + GAP;
+            }
         }
 
         // Tools section

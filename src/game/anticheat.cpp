@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <Windows.h>
 
 namespace anticheat {
 
@@ -52,6 +53,7 @@ static std::string s_debug;
 static int         s_yaw_patch_count = 0;
 static int         s_ace_patch_count = 0;
 static bool        s_md5_patched = false;
+static bool        s_gameguard_patched = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -113,6 +115,58 @@ static bool patch_md5_method(MonoMethod* method, const char* name) {
     VirtualProtect(native, 16, old_protect, &old_protect);
 
     printf("[anticheat] Patched %s at %p\n", name, native);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Patch GameGuard detection callback in UnityPlayer.dll
+// ---------------------------------------------------------------------------
+// sub_14004E9F0 is the nProtect GameGuard callback that handles detection
+// events.  Error codes 1013/1015 (hack detected), 1020 (banned), and 670
+// (collision program) all trigger a MessageBoxTimeoutW dialog followed by
+// a PostMessageW(WM_QUIT) to kill the game.
+//
+// We patch the function entry to: mov eax, 1; ret
+// This prevents the dialog and the forced exit.
+// ---------------------------------------------------------------------------
+static constexpr uintptr_t GG_CALLBACK_RVA = 0x4E9F0;  // sub_14004E9F0
+
+static bool patch_gameguard_callback() {
+    HMODULE unity = GetModuleHandleA("UnityPlayer.dll");
+    if (!unity) {
+        printf("[anticheat] UnityPlayer.dll not found\n");
+        return false;
+    }
+
+    BYTE* target = reinterpret_cast<BYTE*>(unity) + GG_CALLBACK_RVA;
+
+    // Verify we're patching the right place: the function should start with
+    // a recognizable prologue.  sub_14004E9F0 uses sub rsp / push patterns.
+    // We do a loose check: if the first byte is 0xCC (int3 / padding) we're
+    // probably at the wrong offset -- bail out.
+    if (target[0] == 0xCC) {
+        printf("[anticheat] GG callback at %p looks like padding, skipping\n", target);
+        return false;
+    }
+
+    DWORD old_protect;
+    if (!VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        printf("[anticheat] VirtualProtect failed for GG callback\n");
+        return false;
+    }
+
+    // mov eax, 1  (B8 01 00 00 00)
+    // ret         (C3)
+    target[0] = 0xB8;
+    target[1] = 0x01;
+    target[2] = 0x00;
+    target[3] = 0x00;
+    target[4] = 0x00;
+    target[5] = 0xC3;
+
+    VirtualProtect(target, 16, old_protect, &old_protect);
+
+    printf("[anticheat] Patched GameGuard callback at %p\n", target);
     return true;
 }
 
@@ -202,12 +256,16 @@ bool initialize() {
         s_md5_patched = a || b || c;
     }
 
+    // --- Patch GameGuard detection callback (one-time) ---
+    s_gameguard_patched = patch_gameguard_callback();
+
     s_initialized = true;
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "AC: init OK yaw=%p ace=%p md5=%s",
+    snprintf(buf, sizeof(buf), "AC: init OK yaw=%p ace=%p md5=%s gg=%s",
         s_fields.LimitYaw_Yaw, s_classes.AceComponent,
-        s_md5_patched ? "patched" : "no");
+        s_md5_patched ? "patched" : "no",
+        s_gameguard_patched ? "patched" : "no");
     s_debug = buf;
     return true;
 }
@@ -311,6 +369,13 @@ std::string dump_diagnostics() {
     snprintf(buf, sizeof(buf), "  GetMD5HashFromFile=%p CalculateMD5=%p LoadUnityMD5=%p\n",
         s_methods.Md5_GetMD5HashFromFile, s_methods.Md5_CalculateMD5,
         s_methods.Md5_LoadUnityMD5);
+    out += buf;
+
+    HMODULE unity = GetModuleHandleA("UnityPlayer.dll");
+    snprintf(buf, sizeof(buf), "GameGuard: patched=%s callback=%p (UnityPlayer+0x%X)\n",
+        s_gameguard_patched ? "YES" : "NO",
+        unity ? (void*)((BYTE*)unity + GG_CALLBACK_RVA) : nullptr,
+        (unsigned)GG_CALLBACK_RVA);
     out += buf;
 
     out += "debug: " + s_debug + "\n";

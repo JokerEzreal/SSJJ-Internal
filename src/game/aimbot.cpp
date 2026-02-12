@@ -37,7 +37,21 @@ static constexpr int KEYCODE_MOUSE4 = 327;
 // Module state
 // ---------------------------------------------------------------------------
 static bool        s_enabled = true;
+static bool        s_silent  = true;     // silent mode on by default
 static std::string s_debug;
+
+// Silent-mode mouse tracking state
+static bool   s_tracking           = false; // actively tracking real mouse
+static float  s_real_yaw           = 0.0f;  // accumulated real mouse yaw
+static float  s_real_pitch         = 0.0f;  // accumulated real mouse pitch
+static double s_last_written_yaw   = 0.0;   // last TempYaw we wrote (double precision)
+static double s_last_written_pitch = 0.0;   // last TempPitch we wrote
+
+// Camera euler calibration (SSJJ angles → Unity camera euler mapping)
+// Mapping: euler.y = -ssjj_yaw + offset_y,  euler.x = -ssjj_pitch + offset_x
+static bool   s_cam_calibrated     = false;
+static float  s_euler_offset_y     = 0.0f;
+static float  s_euler_offset_x     = 0.0f;
 
 // ---------------------------------------------------------------------------
 // Cached handles
@@ -213,6 +227,13 @@ static void read_input(MonoObject* input, float& yaw, float& pitch) {
     if (s_fields.Input_Pitch) mono::field_get_value(input, s_fields.Input_Pitch, &pitch);
 }
 
+static void read_input_temp(MonoObject* input, double& temp_yaw, double& temp_pitch) {
+    temp_yaw = temp_pitch = 0.0;
+    if (!input) return;
+    if (s_fields.Input_TempYaw)   mono::field_get_value(input, s_fields.Input_TempYaw, &temp_yaw);
+    if (s_fields.Input_TempPitch) mono::field_get_value(input, s_fields.Input_TempPitch, &temp_pitch);
+}
+
 static void write_input(MonoObject* input, float yaw, float pitch) {
     if (!input) return;
     if (s_fields.Input_Yaw)   mono::field_set_value(input, s_fields.Input_Yaw, &yaw);
@@ -231,6 +252,45 @@ static void write_orientation(MonoObject* pe, float yaw, float pitch) {
     if (!ori) return;
     if (s_fields.Orientation_Yaw)   mono::field_set_value(ori, s_fields.Orientation_Yaw, &yaw);
     if (s_fields.Orientation_Pitch) mono::field_set_value(ori, s_fields.Orientation_Pitch, &pitch);
+}
+
+// ---------------------------------------------------------------------------
+// Camera Transform helpers (for silent aim camera override)
+// ---------------------------------------------------------------------------
+static bool get_camera_euler(unity::Vector3& out) {
+    auto& m = unity::methods();
+    if (!m.Camera_get_main || !m.Component_get_transform ||
+        !m.Transform_get_eulerAngles) return false;
+
+    MonoObject* cam = invoke(m.Camera_get_main, nullptr);
+    if (!cam) return false;
+    MonoObject* tf = invoke(m.Component_get_transform, cam);
+    if (!tf) return false;
+    MonoObject* result = invoke(m.Transform_get_eulerAngles, tf);
+    if (!result) return false;
+    auto* p = reinterpret_cast<unity::Vector3*>(mono::object_unbox(result));
+    if (!p) return false;
+    out = *p;
+    return true;
+}
+
+static void set_camera_euler(const unity::Vector3& euler) {
+    auto& m = unity::methods();
+    if (!m.Camera_get_main || !m.Component_get_transform ||
+        !m.Transform_set_eulerAngles) return;
+
+    MonoObject* cam = invoke(m.Camera_get_main, nullptr);
+    if (!cam) return;
+    MonoObject* tf = invoke(m.Component_get_transform, cam);
+    if (!tf) return;
+    unity::Vector3 e = euler;
+    void* args[1] = { &e };
+    invoke(m.Transform_set_eulerAngles, tf, args);
+}
+
+// Convert Unity euler angle [0,360) to signed [-180,180)
+static float euler_to_signed(float e) {
+    return e > 180.0f ? e - 360.0f : e;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,10 +441,15 @@ static void apply_aimbot() {
         if (chosen_bone < 0) continue; // no visible bone on this enemy
 
         // Convert bone Unity pos → SSJJ
+        // For head bone (index 0), raise aim point by +10 units in height
+        unity::Vector3 bone_unity = bone_targets[chosen_bone].world_pos;
+        if (chosen_bone == 0)
+            bone_unity.y += 10.0f;
+
         unity::Vector3 bone_ssjj;
-        bone_ssjj.x =  bone_targets[chosen_bone].world_pos.z;
-        bone_ssjj.y = -bone_targets[chosen_bone].world_pos.x;
-        bone_ssjj.z =  bone_targets[chosen_bone].world_pos.y;
+        bone_ssjj.x =  bone_unity.z;
+        bone_ssjj.y = -bone_unity.x;
+        bone_ssjj.z =  bone_unity.y;
 
         float ty, tp;
         calc_angle(eye, bone_ssjj, ty, tp);
@@ -402,7 +467,13 @@ static void apply_aimbot() {
         }
     }
 
-    if (!found) { s_debug = "AIM: no visible target"; return; }
+    // In normal mode or not-yet-tracking silent mode, return early if no target.
+    // In silent+tracking mode, we must keep running to maintain delta tracking
+    // and camera override — otherwise the camera snaps when a target dies.
+    if (!found && !(s_silent && s_tracking)) {
+        s_debug = "AIM: no visible target";
+        return;
+    }
 
     // ---- Recoil compensation (single-point convergence) ----
     //
@@ -413,35 +484,139 @@ static void apply_aimbot() {
     //   ViewAngle = targetAngle - 2 * PunchAngle
     //
     // This ensures every bullet hits the same point regardless of recoil.
-    float aim_yaw   = normalize_angle(best_yaw   - 2.0f * punch_yaw);
-    float aim_pitch = normalize_angle(best_pitch  - 2.0f * punch_pitch);
+    float aim_yaw   = found ? normalize_angle(best_yaw   - 2.0f * punch_yaw)   : 0.0f;
+    float aim_pitch = found ? normalize_angle(best_pitch  - 2.0f * punch_pitch) : 0.0f;
 
-    // Write to InputComponent (upstream source) so the game naturally
-    // propagates to UserCmd -> OrientationComponent -> Camera.
-    if (input && s_fields.Input_Yaw) {
-        write_input(input, aim_yaw, aim_pitch);
+    if (s_silent && input && s_fields.Input_TempYaw) {
+        // ---- Silent mode ----
+        // Write target angles to InputComponent (affects next UserCmd → server),
+        // but override Camera.main.transform.eulerAngles so the player sees their
+        // real mouse direction.  OrientationComponent alone doesn't control the
+        // camera — the camera Transform is what matters.
+
+        // 0. Read current camera euler (before we change anything)
+        unity::Vector3 cam_euler = {0, 0, 0};
+        bool cam_ok = get_camera_euler(cam_euler);
+
+        // 1. Read current TempYaw/TempPitch — game accumulated mouse delta onto
+        //    whatever we wrote last frame.
+        double cur_temp_yaw, cur_temp_pitch;
+        read_input_temp(input, cur_temp_yaw, cur_temp_pitch);
+
+        if (!s_tracking) {
+            // First frame of silent aiming: initialize real direction from
+            // current state (camera hasn't been affected by aimbot yet).
+            float ori_yaw, ori_pitch;
+            read_orientation(pe, ori_yaw, ori_pitch);
+            s_real_yaw   = ori_yaw;
+            s_real_pitch = ori_pitch;
+            s_last_written_yaw   = cur_temp_yaw;
+            s_last_written_pitch = cur_temp_pitch;
+
+            // Calibrate SSJJ → Unity euler mapping:
+            //   euler.y = -ssjj_yaw + offset_y
+            //   euler.x = -ssjj_pitch + offset_x
+            if (cam_ok) {
+                s_euler_offset_y = euler_to_signed(cam_euler.y) + ori_yaw;
+                s_euler_offset_x = euler_to_signed(cam_euler.x) + ori_pitch;
+                s_cam_calibrated = true;
+            }
+
+            s_tracking = true;
+        } else {
+            // Extract mouse delta and accumulate into real direction
+            double delta_yaw   = cur_temp_yaw   - s_last_written_yaw;
+            double delta_pitch = cur_temp_pitch  - s_last_written_pitch;
+            s_real_yaw   = normalize_angle(s_real_yaw   + static_cast<float>(delta_yaw));
+            s_real_pitch = normalize_angle(s_real_pitch  + static_cast<float>(delta_pitch));
+            // Clamp pitch to valid range
+            if (s_real_pitch >  89.0f) s_real_pitch =  89.0f;
+            if (s_real_pitch < -89.0f) s_real_pitch = -89.0f;
+        }
+
+        // 2. Write angles to InputComponent
+        if (found) {
+            // Target acquired: write target angles → server hit detection
+            write_input(input, aim_yaw, aim_pitch);
+            s_last_written_yaw   = static_cast<double>(aim_yaw);
+            s_last_written_pitch = static_cast<double>(aim_pitch);
+        } else {
+            // No target (died/out of range): write real angles → smooth control
+            write_input(input, s_real_yaw, s_real_pitch);
+            s_last_written_yaw   = static_cast<double>(s_real_yaw);
+            s_last_written_pitch = static_cast<double>(s_real_pitch);
+        }
+
+        // 3. Write real to OrientationComponent (affects player model / first-person weapon)
+        write_orientation(pe, s_real_yaw, s_real_pitch);
+
+        // 4. Override camera Transform to show the real mouse direction
+        //    This is the critical step — the camera's Transform is what the
+        //    renderer actually uses.  We run in LateUpdate, right before render.
+        if (s_cam_calibrated) {
+            unity::Vector3 desired;
+            desired.x = -s_real_pitch + s_euler_offset_x;
+            desired.y = -s_real_yaw   + s_euler_offset_y;
+            desired.z = cam_ok ? cam_euler.z : 0.0f;  // preserve roll
+            set_camera_euler(desired);
+        }
+    } else {
+        // ---- Normal mode (existing behavior) ----
+        if (!found) { s_debug = "AIM: no visible target"; return; }
+        // Write to InputComponent (upstream source) so the game naturally
+        // propagates to UserCmd -> OrientationComponent -> Camera.
+        if (input && s_fields.Input_Yaw) {
+            write_input(input, aim_yaw, aim_pitch);
+        }
+        // Also write to OrientationComponent as fallback / immediate effect
+        write_orientation(pe, aim_yaw, aim_pitch);
+        s_tracking = false;
     }
-    // Also write to OrientationComponent as fallback / immediate effect
-    write_orientation(pe, aim_yaw, aim_pitch);
 
-    char buf[256];
-    snprintf(buf, sizeof(buf), "AIM: -> %s [%s] (%.1f deg) punch=(%.1f,%.1f)",
-        target_name.c_str(), target_bone_name.c_str(), best_dist,
-        punch_yaw, punch_pitch);
-    s_debug = buf;
+    if (found) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "AIM%s: -> %s [%s] (%.1f deg) punch=(%.1f,%.1f)",
+            s_silent ? " [S]" : "",
+            target_name.c_str(), target_bone_name.c_str(), best_dist,
+            punch_yaw, punch_pitch);
+        s_debug = buf;
+    } else {
+        s_debug = "AIM [S]: scanning...";
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-frame update
 // ---------------------------------------------------------------------------
 void update() {
-    if (!s_enabled) { s_debug = ""; return; }
+    if (!s_enabled) {
+        // If we were tracking, hand back control cleanly
+        if (s_tracking) {
+            MonoObject* input = get_input_component();
+            if (input) write_input(input, s_real_yaw, s_real_pitch);
+            MonoObject* pe = get_local_player_entity();
+            if (pe) write_orientation(pe, s_real_yaw, s_real_pitch);
+            s_tracking = false;
+            s_cam_calibrated = false;
+        }
+        s_debug = "";
+        return;
+    }
 
     // Activate aimbot while mouse side button is held
     // Mouse3 (KeyCode 326) = thumb back button
     bool active = gui::get_key(KEYCODE_MOUSE3);
     if (!active) {
-        s_debug = "AIM: ready [Mouse3]";
+        // Key released — hand back control to real mouse direction
+        if (s_tracking) {
+            MonoObject* input = get_input_component();
+            if (input) write_input(input, s_real_yaw, s_real_pitch);
+            MonoObject* pe = get_local_player_entity();
+            if (pe) write_orientation(pe, s_real_yaw, s_real_pitch);
+            s_tracking = false;
+            s_cam_calibrated = false;
+        }
+        s_debug = s_silent ? "AIM: ready [Mouse3] [Silent]" : "AIM: ready [Mouse3]";
         return;
     }
 
@@ -453,6 +628,8 @@ void update() {
 // ---------------------------------------------------------------------------
 void set_enabled(bool e) { s_enabled = e; }
 bool is_enabled()        { return s_enabled; }
+void set_silent(bool s)  { s_silent = s; }
+bool is_silent()         { return s_silent; }
 const char* get_debug_info() { return s_debug.c_str(); }
 
 void shutdown() {
@@ -460,6 +637,9 @@ void shutdown() {
     s_methods = {};
     s_fields  = {};
     s_enabled = false;
+    s_silent  = true;
+    s_tracking = false;
+    s_cam_calibrated = false;
 }
 
 } // namespace aimbot

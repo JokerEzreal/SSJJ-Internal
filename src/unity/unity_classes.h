@@ -15,6 +15,7 @@ struct CachedImages {
     MonoImage* physics_lib     = nullptr;  // SSJJPhysics_Library (BSP physics)
     MonoImage* physics_net     = nullptr;  // physics.net (trace types)
     MonoImage* base_lib        = nullptr;  // SSJJBase_Library (utilities)
+    MonoImage* base_net        = nullptr;  // base.net (share types: Vector3D etc.)
 };
 
 // Cached MonoClass* handles for Unity engine classes
@@ -110,10 +111,16 @@ struct CachedMethods {
     MonoMethod* Texture2D_Apply_0         = nullptr;  // Apply()
 
     // ---- Transform ----
-    MonoMethod* Transform_get_position    = nullptr;  // Transform.position -> Vector3
-    MonoMethod* Transform_get_childCount  = nullptr;  // Transform.childCount -> int
-    MonoMethod* Transform_GetChild        = nullptr;  // Transform.GetChild(int) -> Transform
-    MonoMethod* Transform_get_parent      = nullptr;  // Transform.parent -> Transform
+    MonoMethod* Transform_get_position      = nullptr;  // Transform.position -> Vector3
+    MonoMethod* Transform_get_childCount    = nullptr;  // Transform.childCount -> int
+    MonoMethod* Transform_GetChild          = nullptr;  // Transform.GetChild(int) -> Transform
+    MonoMethod* Transform_get_parent        = nullptr;  // Transform.parent -> Transform
+    MonoMethod* Transform_TransformPoint    = nullptr;  // Transform.TransformPoint(Vector3) -> Vector3
+    MonoMethod* Transform_get_eulerAngles   = nullptr;  // Transform.eulerAngles -> Vector3
+    MonoMethod* Transform_set_eulerAngles   = nullptr;  // Transform.eulerAngles = Vector3
+
+    // ---- Component ----
+    MonoMethod* Component_get_transform     = nullptr;  // Component.transform -> Transform
 
     // ---- GameObject ----
     MonoMethod* GameObject_get_transform  = nullptr;  // GameObject.transform -> Transform

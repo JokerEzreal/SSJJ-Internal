@@ -97,6 +97,9 @@ bool cache_initialize() {
         else if (strcmp(name, "SSJJBase_Library") == 0) {
             s_images.base_lib = img;
         }
+        else if (strcmp(name, "base.net") == 0) {
+            s_images.base_net = img;
+        }
     }
 
     // If we never found dedicated modules, fall back to main engine image
@@ -235,10 +238,21 @@ bool cache_initialize() {
 
     // ---- Transform ----
     if (s_classes.Transform) {
-        s_methods.Transform_get_position   = mono::class_get_method_from_name(s_classes.Transform, "get_position", 0);
-        s_methods.Transform_get_childCount = mono::class_get_method_from_name(s_classes.Transform, "get_childCount", 0);
-        s_methods.Transform_GetChild       = mono::class_get_method_from_name(s_classes.Transform, "GetChild", 1);
-        s_methods.Transform_get_parent     = mono::class_get_method_from_name(s_classes.Transform, "get_parent", 0);
+        s_methods.Transform_get_position     = mono::class_get_method_from_name(s_classes.Transform, "get_position", 0);
+        s_methods.Transform_get_childCount   = mono::class_get_method_from_name(s_classes.Transform, "get_childCount", 0);
+        s_methods.Transform_GetChild         = mono::class_get_method_from_name(s_classes.Transform, "GetChild", 1);
+        s_methods.Transform_get_parent       = mono::class_get_method_from_name(s_classes.Transform, "get_parent", 0);
+        s_methods.Transform_TransformPoint   = mono::class_get_method_from_name(s_classes.Transform, "TransformPoint", 1);
+        s_methods.Transform_get_eulerAngles  = mono::class_get_method_from_name(s_classes.Transform, "get_eulerAngles", 0);
+        s_methods.Transform_set_eulerAngles  = mono::class_get_method_from_name(s_classes.Transform, "set_eulerAngles", 1);
+    }
+
+    // ---- Component (base class for Camera, etc.) ----
+    {
+        MonoClass* Component = find_class("UnityEngine", "Component", core_img);
+        if (Component) {
+            s_methods.Component_get_transform = mono::class_get_method_from_name(Component, "get_transform", 0);
+        }
     }
 
     // ---- GameObject ----

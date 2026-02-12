@@ -24,6 +24,10 @@ bool is_enabled();
 void set_skeleton_enabled(bool enabled);
 bool is_skeleton_enabled();
 
+// Toggle hitbox ESP on/off.
+void set_hitbox_enabled(bool enabled);
+bool is_hitbox_enabled();
+
 // Debug info string
 const char* get_esp_debug();
 
@@ -33,6 +37,9 @@ void request_bone_dump();
 
 // Per-player skeleton summary for dump (call from OnGUI thread)
 std::string dump_per_player_skeleton();
+
+// Per-player hitbox data dump (call from OnGUI thread)
+std::string dump_per_player_hitboxes();
 
 // Get head bone world position (Unity coords) for a player entity.
 // Returns false if skeleton data unavailable (falls back to estimated).

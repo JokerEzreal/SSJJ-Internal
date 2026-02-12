@@ -23,6 +23,7 @@ namespace esp {
 // ---------------------------------------------------------------------------
 static bool       s_enabled       = true;
 static bool       s_skeleton_enabled = true;
+static bool       s_hitbox_enabled   = false;
 static MonoObject* s_white_tex    = nullptr;
 static uint32_t    s_tex_gc_handle = 0;
 
@@ -282,6 +283,97 @@ static void init_skeleton_cache() {
         s_skel.TPU_ThirdTran = mono::class_get_field_from_name(
             s_skel.ThirdPersonUnityObjectsComponent, "ThirdTran");
     }
+}
+
+// ---------------------------------------------------------------------------
+// HitBox ESP cached handles
+// ---------------------------------------------------------------------------
+static struct {
+    MonoMethod*     PE_get_hitBox       = nullptr;  // PlayerEntity.get_hitBox()
+    MonoMethod*     PE_get_hasHitBox    = nullptr;  // PlayerEntity.get_hasHitBox()
+    MonoClassField* HBC_HitBoxList      = nullptr;  // HitBoxComponent.HitBoxList
+    MonoClassField* HBC_BonetTransform  = nullptr;  // HitBoxComponent.BonetTransform
+    MonoClassField* HB_org              = nullptr;  // HitBox.org (Vector3D, private)
+    MonoClassField* HB_sizeX            = nullptr;  // HitBox.sizeX (double)
+    MonoClassField* HB_sizeY            = nullptr;  // HitBox.sizeY (double)
+    MonoClassField* HB_sizeZ            = nullptr;  // HitBox.sizeZ (double)
+    MonoClassField* HB_jointName        = nullptr;  // HitBox.jointName (string)
+    MonoClassField* HB_rotationX        = nullptr;  // HitBox.rotationX (double)
+    MonoClassField* HB_rotationY        = nullptr;  // HitBox.rotationY (double)
+    MonoClassField* HB_rotationZ        = nullptr;  // HitBox.rotationZ (double)
+    MonoClassField* V3D_x               = nullptr;  // Vector3D.x (double)
+    MonoClassField* V3D_y               = nullptr;  // Vector3D.y (double)
+    MonoClassField* V3D_z               = nullptr;  // Vector3D.z (double)
+    MonoMethod*     list_get_Count      = nullptr;  // List<HitBox>.get_Count
+    MonoMethod*     list_get_Item       = nullptr;  // List<HitBox>.get_Item
+    bool            initialized         = false;
+} s_hb;
+
+static void init_hitbox_cache() {
+    if (s_hb.initialized) return;
+    s_hb.initialized = true;
+
+    MonoImage* ent_img = unity::images().entitas_lib;
+    MonoImage* phys_net = unity::images().physics_net;
+    MonoImage* base_net = unity::images().base_net;
+    if (!ent_img) return;
+
+    // PlayerEntity methods
+    MonoClass* PlayerEntity = mono::class_from_name(ent_img, "", "PlayerEntity");
+    if (PlayerEntity) {
+        s_hb.PE_get_hitBox    = mono::class_get_method_from_name(PlayerEntity, "get_hitBox", 0);
+        s_hb.PE_get_hasHitBox = mono::class_get_method_from_name(PlayerEntity, "get_hasHitBox", 0);
+    }
+
+    // HitBoxComponent fields
+    MonoClass* HitBoxComp = mono::class_from_name(
+        ent_img, "Assets.Sources.Components.Player.BattleRoom", "HitBoxComponent");
+    if (HitBoxComp) {
+        s_hb.HBC_HitBoxList     = mono::class_get_field_from_name(HitBoxComp, "HitBoxList");
+        s_hb.HBC_BonetTransform = mono::class_get_field_from_name(HitBoxComp, "BonetTransform");
+    }
+
+    // physics.data.HitBox fields (in physics.net)
+    if (phys_net) {
+        MonoClass* HitBox = mono::class_from_name(phys_net, "physics.data", "HitBox");
+        if (HitBox) {
+            s_hb.HB_org       = mono::class_get_field_from_name(HitBox, "org");
+            s_hb.HB_sizeX     = mono::class_get_field_from_name(HitBox, "sizeX");
+            s_hb.HB_sizeY     = mono::class_get_field_from_name(HitBox, "sizeY");
+            s_hb.HB_sizeZ     = mono::class_get_field_from_name(HitBox, "sizeZ");
+            s_hb.HB_jointName = mono::class_get_field_from_name(HitBox, "jointName");
+            s_hb.HB_rotationX = mono::class_get_field_from_name(HitBox, "rotationX");
+            s_hb.HB_rotationY = mono::class_get_field_from_name(HitBox, "rotationY");
+            s_hb.HB_rotationZ = mono::class_get_field_from_name(HitBox, "rotationZ");
+        }
+    }
+
+    // share.Vector3D fields (in base.net)
+    if (base_net) {
+        MonoClass* V3D = mono::class_from_name(base_net, "share", "Vector3D");
+        if (V3D) {
+            s_hb.V3D_x = mono::class_get_field_from_name(V3D, "x");
+            s_hb.V3D_y = mono::class_get_field_from_name(V3D, "y");
+            s_hb.V3D_z = mono::class_get_field_from_name(V3D, "z");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transform.TransformPoint helper: bone-local -> world
+// ---------------------------------------------------------------------------
+static bool transform_point(MonoObject* transform, const unity::Vector3& local, unity::Vector3& out) {
+    if (!transform) return false;
+    MonoMethod* tp = unity::methods().Transform_TransformPoint;
+    if (!tp) return false;
+    unity::Vector3 pos = local;
+    void* args[1] = { &pos };
+    MonoObject* result = invoke_safe(tp, transform, args);
+    if (!result) return false;
+    auto* v = static_cast<unity::Vector3*>(mono::object_unbox(result));
+    if (!v) return false;
+    out = *v;
+    return true;
 }
 
 // Read Transform.position -> Unity world Vector3
@@ -635,74 +727,19 @@ static CachedSkeleton* get_or_populate_skeleton(MonoObject* player_entity)
 }
 
 // ---------------------------------------------------------------------------
-// Smart visibility propagation
-// ---------------------------------------------------------------------------
-// Instead of raycasting all 20 bones, check only 3 key bones (HEAD, SPINE1,
-// PELVIS) and propagate visibility to nearby bones.  This reduces the number
-// of BspTrace WorldTrace calls from ~20 to 3 per player.
-//
-// Propagation rules:
-//   HEAD visible   -> NECK inherits
-//   SPINE1 visible -> SPINE2, SPINE, NECK inherit
-//   PELVIS visible -> SPINE inherits
-//   Upper body (SPINE2/NECK) visible -> arm chain bones inherit
-//   PELVIS visible -> leg chain bones inherit
+// Per-bone visibility: raycast every bone individually
 // ---------------------------------------------------------------------------
 static void compute_smart_visibility(const unity::Vector3& eye_unity,
                                      unity::Vector3 world_pos[BONE_COUNT],
                                      bool bones_valid[BONE_COUNT],
                                      bool bone_visible[BONE_COUNT])
 {
-    // Initialize all as not visible
-    for (int i = 0; i < BONE_COUNT; i++)
-        bone_visible[i] = false;
-
-    // Raycast the 3 key bones
-    bool head_vis   = false;
-    bool spine1_vis = false;
-    bool pelvis_vis = false;
-
-    if (bones_valid[BONE_HEAD])
-        head_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_HEAD]);
-    if (bones_valid[BONE_SPINE1])
-        spine1_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_SPINE1]);
-    if (bones_valid[BONE_PELVIS])
-        pelvis_vis = visibility::is_visible_unity(eye_unity, world_pos[BONE_PELVIS]);
-
-    // Set the directly-checked bones
-    bone_visible[BONE_HEAD]   = head_vis;
-    bone_visible[BONE_SPINE1] = spine1_vis;
-    bone_visible[BONE_PELVIS] = pelvis_vis;
-
-    // Propagate: NECK inherits from HEAD or SPINE1
-    bone_visible[BONE_NECK] = head_vis || spine1_vis;
-
-    // Propagate: SPINE2 inherits from SPINE1 (or HEAD as backup)
-    bone_visible[BONE_SPINE2] = spine1_vis || head_vis;
-
-    // Propagate: SPINE inherits from SPINE1 or PELVIS
-    bone_visible[BONE_SPINE] = spine1_vis || pelvis_vis;
-
-    // Propagate: upper body visible = any of SPINE2/NECK/SPINE1 visible
-    bool upper_body_vis = spine1_vis || head_vis;
-
-    // Arm bones inherit from upper body visibility
-    bone_visible[BONE_L_CLAVICLE]  = upper_body_vis;
-    bone_visible[BONE_R_CLAVICLE]  = upper_body_vis;
-    bone_visible[BONE_L_UPPER_ARM] = upper_body_vis;
-    bone_visible[BONE_R_UPPER_ARM] = upper_body_vis;
-    bone_visible[BONE_L_FOREARM]   = upper_body_vis;
-    bone_visible[BONE_R_FOREARM]   = upper_body_vis;
-    bone_visible[BONE_L_HAND]      = upper_body_vis;
-    bone_visible[BONE_R_HAND]      = upper_body_vis;
-
-    // Leg bones inherit from PELVIS visibility
-    bone_visible[BONE_L_THIGH] = pelvis_vis;
-    bone_visible[BONE_R_THIGH] = pelvis_vis;
-    bone_visible[BONE_L_CALF]  = pelvis_vis;
-    bone_visible[BONE_R_CALF]  = pelvis_vis;
-    bone_visible[BONE_L_FOOT]  = pelvis_vis;
-    bone_visible[BONE_R_FOOT]  = pelvis_vis;
+    for (int i = 0; i < BONE_COUNT; i++) {
+        if (bones_valid[i])
+            bone_visible[i] = visibility::is_visible_unity(eye_unity, world_pos[i]);
+        else
+            bone_visible[i] = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -845,14 +882,310 @@ const char* get_bone_dump() { return s_bone_debug.c_str(); }
 void request_bone_dump() { s_bone_debug.clear(); }
 
 // ---------------------------------------------------------------------------
+// HitBox ESP: draw wireframe hitboxes for a single player
+// ---------------------------------------------------------------------------
+// Uses Transform.TransformPoint to properly convert bone-local hitbox coords
+// to world space, accounting for bone rotation and scale.
+static void draw_player_hitboxes(MonoObject* player_entity,
+                                  float screen_w, float screen_h,
+                                  const unity::Color& col)
+{
+    if (!player_entity) return;
+    if (!s_hb.PE_get_hasHitBox || !s_hb.PE_get_hitBox) return;
+    if (!s_hb.HBC_HitBoxList || !s_hb.HB_org) return;
+    if (!s_hb.V3D_x || !s_hb.V3D_y || !s_hb.V3D_z) return;
+
+    // Check hasHitBox
+    MonoObject* has_res = invoke_safe(s_hb.PE_get_hasHitBox, player_entity);
+    if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res))) return;
+
+    // Get HitBoxComponent
+    MonoObject* hb_comp = invoke_safe(s_hb.PE_get_hitBox, player_entity);
+    if (!hb_comp) return;
+
+    // Read HitBoxList (List<HitBox>)
+    MonoObject* hb_list = nullptr;
+    mono::field_get_value(hb_comp, s_hb.HBC_HitBoxList, &hb_list);
+    if (!hb_list) return;
+
+    // Resolve List methods dynamically on first use
+    if (!s_hb.list_get_Count || !s_hb.list_get_Item) {
+        if (!mono::object_get_class) return;
+        MonoClass* list_cls = mono::object_get_class(hb_list);
+        if (!list_cls) return;
+        s_hb.list_get_Count = mono::class_get_method_from_name(list_cls, "get_Count", 0);
+        s_hb.list_get_Item  = mono::class_get_method_from_name(list_cls, "get_Item", 1);
+        if (!s_hb.list_get_Count || !s_hb.list_get_Item) return;
+    }
+
+    // Get count
+    MonoObject* count_res = invoke_safe(s_hb.list_get_Count, hb_list);
+    if (!count_res) return;
+    int count = *static_cast<int*>(mono::object_unbox(count_res));
+    if (count <= 0 || count > 50) return;
+
+    // Get skeleton cache for bone transforms
+    CachedSkeleton* cached = get_or_populate_skeleton(player_entity);
+
+    for (int i = 0; i < count; i++) {
+        void* idx_args[1] = { &i };
+        MonoObject* hb = invoke_safe(s_hb.list_get_Item, hb_list, idx_args);
+        if (!hb) continue;
+
+        // Read jointName to classify and find the bone Transform
+        MonoObject* jn_obj = nullptr;
+        mono::field_get_value(hb, s_hb.HB_jointName, &jn_obj);
+        std::string joint_name;
+        if (jn_obj) {
+            char* utf8 = mono::string_to_utf8(reinterpret_cast<MonoString*>(jn_obj));
+            if (utf8) {
+                joint_name = utf8;
+                if (mono::free_mem) mono::free_mem(utf8);
+            }
+        }
+
+        // Classify jointName to BoneId to find the associated Transform
+        BoneId bone_id = BONE_UNKNOWN;
+        if (!joint_name.empty()) bone_id = classify_bone(joint_name);
+        MonoObject* bone_tf = nullptr;
+        if (cached && bone_id != BONE_UNKNOWN) {
+            bone_tf = cached->transforms[bone_id];
+        }
+        if (!bone_tf) continue; // can't position this hitbox without its bone
+
+        // Read org (Vector3D - reference type, bone-local SSJJ coords)
+        MonoObject* org_obj = nullptr;
+        mono::field_get_value(hb, s_hb.HB_org, &org_obj);
+        double org_x = 0, org_y = 0, org_z = 0;
+        if (org_obj) {
+            mono::field_get_value(org_obj, s_hb.V3D_x, &org_x);
+            mono::field_get_value(org_obj, s_hb.V3D_y, &org_y);
+            mono::field_get_value(org_obj, s_hb.V3D_z, &org_z);
+        }
+
+        // Read sizes (full extents)
+        double sx = 0, sy = 0, sz = 0;
+        mono::field_get_value(hb, s_hb.HB_sizeX, &sx);
+        mono::field_get_value(hb, s_hb.HB_sizeY, &sy);
+        mono::field_get_value(hb, s_hb.HB_sizeZ, &sz);
+
+        if (sx <= 0 || sy <= 0 || sz <= 0) continue;
+
+        // Convert org from SSJJ bone-local to Unity bone-local:
+        // Unity(-ssjj.y, ssjj.z, ssjj.x)
+        unity::Vector3 org_local = {
+            (float)(-org_y),
+            (float)(org_z),
+            (float)(org_x)
+        };
+
+        // TransformPoint: center in world space
+        unity::Vector3 center;
+        if (!transform_point(bone_tf, org_local, center)) continue;
+
+        // Build 3 axis half-extent vectors using TransformPoint.
+        // SSJJ X half-ext (sx/2,0,0) -> Unity local (0, 0, sx/2)
+        // SSJJ Y half-ext (0,sy/2,0) -> Unity local (-sy/2, 0, 0)
+        // SSJJ Z half-ext (0,0,sz/2) -> Unity local (0, sz/2, 0)
+        float hsx = (float)(sx * 0.5);
+        float hsy = (float)(sy * 0.5);
+        float hsz = (float)(sz * 0.5);
+
+        unity::Vector3 ax_end, ay_end, az_end;
+        unity::Vector3 ax_local = { org_local.x,        org_local.y,        org_local.z + hsx };
+        unity::Vector3 ay_local = { org_local.x - hsy,  org_local.y,        org_local.z };
+        unity::Vector3 az_local = { org_local.x,        org_local.y + hsz,  org_local.z };
+
+        if (!transform_point(bone_tf, ax_local, ax_end)) continue;
+        if (!transform_point(bone_tf, ay_local, ay_end)) continue;
+        if (!transform_point(bone_tf, az_local, az_end)) continue;
+
+        // Axis half-extent vectors in world space
+        unity::Vector3 ax = { ax_end.x - center.x, ax_end.y - center.y, ax_end.z - center.z };
+        unity::Vector3 ay = { ay_end.x - center.x, ay_end.y - center.y, ay_end.z - center.z };
+        unity::Vector3 az = { az_end.x - center.x, az_end.y - center.y, az_end.z - center.z };
+
+        // Generate 8 corners: center ± ax ± ay ± az
+        // Order: (-,-,-)(0) (-,-,+)(1) (-,+,-)(2) (-,+,+)(3)
+        //        (+,-,-)(4) (+,-,+)(5) (+,+,-)(6) (+,+,+)(7)
+        unity::Vector3 corners[8];
+        int ci = 0;
+        for (int si = -1; si <= 1; si += 2) {
+            for (int sj = -1; sj <= 1; sj += 2) {
+                for (int sk = -1; sk <= 1; sk += 2) {
+                    corners[ci].x = center.x + si * ax.x + sj * ay.x + sk * az.x;
+                    corners[ci].y = center.y + si * ax.y + sj * ay.y + sk * az.y;
+                    corners[ci].z = center.z + si * ax.z + sj * ay.z + sk * az.z;
+                    ci++;
+                }
+            }
+        }
+
+        // Project all 8 corners to screen
+        ScreenPos sp[8];
+        bool all_visible = true;
+        for (int c = 0; c < 8; c++) {
+            sp[c] = world_to_screen(corners[c], screen_w, screen_h);
+            if (!sp[c].visible) { all_visible = false; break; }
+        }
+        if (!all_visible) continue;
+
+        // Draw 12 edges of the wireframe box
+        // az edges (vary k): {0,1},{2,3},{4,5},{6,7}
+        // ay edges (vary j): {0,2},{1,3},{4,6},{5,7}
+        // ax edges (vary i): {0,4},{1,5},{2,6},{3,7}
+        static const int edges[12][2] = {
+            {0,1},{2,3},{4,5},{6,7},  // az
+            {0,2},{1,3},{4,6},{5,7},  // ay
+            {0,4},{1,5},{2,6},{3,7},  // ax
+        };
+
+        for (int e = 0; e < 12; e++) {
+            int a = edges[e][0], b = edges[e][1];
+            draw_line(sp[a].x, sp[a].y, sp[b].x, sp[b].y, 1.0f, col);
+        }
+    }
+}
+
+// Forward declaration (defined later, after dump_per_player_skeleton)
+static const char* bone_id_name(BoneId id);
+
+// ---------------------------------------------------------------------------
+// Dump per-player hitbox data for AI analysis
+// ---------------------------------------------------------------------------
+std::string dump_per_player_hitboxes() {
+    init_hitbox_cache();
+    std::string out;
+    char buf[512];
+
+    if (!s_hb.PE_get_hasHitBox || !s_hb.PE_get_hitBox || !s_hb.HBC_HitBoxList) {
+        return "(hitbox cache not initialized)\n";
+    }
+
+    auto players = player_info::read_all_players();
+    for (const auto& p : players) {
+        if (!p.valid || !p._raw_entity) continue;
+
+        snprintf(buf, sizeof(buf), "\n--- %s (EID:%d Team:%d%s) ---\n",
+            p.name.c_str(), p.entity_id, p.team_id, p.is_local ? " LOCAL" : "");
+        out += buf;
+
+        // Check hasHitBox
+        MonoObject* has_res = invoke_safe(s_hb.PE_get_hasHitBox, p._raw_entity);
+        if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res))) {
+            out += "  (no HitBoxComponent)\n";
+            continue;
+        }
+
+        MonoObject* hb_comp = invoke_safe(s_hb.PE_get_hitBox, p._raw_entity);
+        if (!hb_comp) { out += "  (hitBox null)\n"; continue; }
+
+        MonoObject* hb_list = nullptr;
+        mono::field_get_value(hb_comp, s_hb.HBC_HitBoxList, &hb_list);
+        if (!hb_list) { out += "  (HitBoxList null)\n"; continue; }
+
+        if (!s_hb.list_get_Count || !s_hb.list_get_Item) {
+            if (mono::object_get_class) {
+                MonoClass* list_cls = mono::object_get_class(hb_list);
+                if (list_cls) {
+                    s_hb.list_get_Count = mono::class_get_method_from_name(list_cls, "get_Count", 0);
+                    s_hb.list_get_Item  = mono::class_get_method_from_name(list_cls, "get_Item", 1);
+                }
+            }
+        }
+        if (!s_hb.list_get_Count || !s_hb.list_get_Item) {
+            out += "  (List methods not resolved)\n"; continue;
+        }
+
+        MonoObject* count_res = invoke_safe(s_hb.list_get_Count, hb_list);
+        if (!count_res) { out += "  (count failed)\n"; continue; }
+        int count = *static_cast<int*>(mono::object_unbox(count_res));
+
+        snprintf(buf, sizeof(buf), "  hitbox count: %d\n", count);
+        out += buf;
+
+        for (int i = 0; i < count && i < 50; i++) {
+            void* idx_args[1] = { &i };
+            MonoObject* hb = invoke_safe(s_hb.list_get_Item, hb_list, idx_args);
+            if (!hb) { out += "  (null hitbox)\n"; continue; }
+
+            // jointName
+            std::string joint_name = "(null)";
+            MonoObject* jn_obj = nullptr;
+            mono::field_get_value(hb, s_hb.HB_jointName, &jn_obj);
+            if (jn_obj) {
+                char* utf8 = mono::string_to_utf8(reinterpret_cast<MonoString*>(jn_obj));
+                if (utf8) { joint_name = utf8; if (mono::free_mem) mono::free_mem(utf8); }
+            }
+
+            // org
+            double org_x = 0, org_y = 0, org_z = 0;
+            MonoObject* org_obj = nullptr;
+            if (s_hb.HB_org) mono::field_get_value(hb, s_hb.HB_org, &org_obj);
+            if (org_obj && s_hb.V3D_x && s_hb.V3D_y && s_hb.V3D_z) {
+                mono::field_get_value(org_obj, s_hb.V3D_x, &org_x);
+                mono::field_get_value(org_obj, s_hb.V3D_y, &org_y);
+                mono::field_get_value(org_obj, s_hb.V3D_z, &org_z);
+            }
+
+            // sizes
+            double sx = 0, sy = 0, sz = 0;
+            if (s_hb.HB_sizeX) mono::field_get_value(hb, s_hb.HB_sizeX, &sx);
+            if (s_hb.HB_sizeY) mono::field_get_value(hb, s_hb.HB_sizeY, &sy);
+            if (s_hb.HB_sizeZ) mono::field_get_value(hb, s_hb.HB_sizeZ, &sz);
+
+            // rotations
+            double rx = 0, ry = 0, rz = 0;
+            if (s_hb.HB_rotationX) mono::field_get_value(hb, s_hb.HB_rotationX, &rx);
+            if (s_hb.HB_rotationY) mono::field_get_value(hb, s_hb.HB_rotationY, &ry);
+            if (s_hb.HB_rotationZ) mono::field_get_value(hb, s_hb.HB_rotationZ, &rz);
+
+            // Classify bone
+            BoneId bone_id = BONE_UNKNOWN;
+            if (!joint_name.empty() && joint_name != "(null)")
+                bone_id = classify_bone(joint_name);
+
+            snprintf(buf, sizeof(buf),
+                "  [%d] joint=\"%s\" boneId=%d(%s)\n"
+                "      org=(%.1f, %.1f, %.1f) size=(%.1f, %.1f, %.1f)\n"
+                "      rot=(%.1f, %.1f, %.1f)\n",
+                i, joint_name.c_str(), (int)bone_id,
+                bone_id != BONE_UNKNOWN ? bone_id_name(bone_id) : "?",
+                org_x, org_y, org_z, sx, sy, sz, rx, ry, rz);
+            out += buf;
+        }
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Get head bone world position for a player entity (usable from any context)
 // ---------------------------------------------------------------------------
+// Approximate head hitbox org offset in SSJJ bone-local coords.
+// From game data: typically org=(10, 2, 0) for standard models.
+// Converted to Unity bone-local: (-org.y, org.z, org.x) = (-2, 0, 10)
+static const unity::Vector3 HEAD_HITBOX_OFFSET_LOCAL = { -2.0f, 0.0f, 10.0f };
+
 bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
     init_skeleton_cache();
 
     if (!player_entity) return false;
     if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
         !s_skel.PE_get_thirdPersonUnityObjects) return false;
+
+    // Helper: try to get head hitbox center via TransformPoint, with fallback
+    // to raw position if TransformPoint is unavailable.
+    auto try_head_transform = [&](MonoObject* head_tf) -> bool {
+        if (!head_tf) return false;
+        // Try TransformPoint with hitbox offset for accurate head center
+        if (unity::methods().Transform_TransformPoint) {
+            if (transform_point(head_tf, HEAD_HITBOX_OFFSET_LOCAL, out))
+                return true;
+        }
+        // Fallback: raw bone position (at neck/skull joint)
+        return get_transform_position(head_tf, out);
+    };
 
     // Try the persistent cache first -- if we have a cached HEAD transform,
     // we can read its position directly without any hierarchy walk.
@@ -861,12 +1194,12 @@ bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
         CachedSkeleton& cached = it->second;
         // Try the classified head bone
         if (cached.transforms[BONE_HEAD]) {
-            if (get_transform_position(cached.transforms[BONE_HEAD], out))
+            if (try_head_transform(cached.transforms[BONE_HEAD]))
                 return true;
         }
         // Try the fallback head
         if (cached.fallback_head) {
-            if (get_transform_position(cached.fallback_head, out))
+            if (try_head_transform(cached.fallback_head))
                 return true;
         }
     }
@@ -893,7 +1226,7 @@ bool get_head_bone_world_pos(MonoObject* player_entity, unity::Vector3& out) {
         mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &head_tf);
     if (!head_tf) return false;
 
-    return get_transform_position(head_tf, out);
+    return try_head_transform(head_tf);
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1490,9 @@ void draw() {
     // Initialize skeleton cache on first draw
     init_skeleton_cache();
 
+    // Initialize hitbox cache on first draw
+    init_hitbox_cache();
+
     // Cache Camera.main once per frame (avoids hundreds of Camera.get_main invokes)
     refresh_frame_camera();
 
@@ -1351,6 +1687,21 @@ void draw() {
         }
     }
 
+    // --------------- HitBox ESP pass ---------------
+    int hb_drawn = 0;
+    if (s_hitbox_enabled && s_hb.PE_get_hitBox) {
+        unity::Color hb_col(0.0f, 0.8f, 1.0f, 0.8f); // cyan
+
+        for (const auto& p : players) {
+            if (!p.valid || p.is_local || p.is_dead) continue;
+            if (local_team >= 0 && p.team_id == local_team) continue;
+            if (!p._raw_entity) continue;
+
+            draw_player_hitboxes(p._raw_entity, screen_w, screen_h, hb_col);
+            hb_drawn++;
+        }
+    }
+
     // Track draw gaps for stall diagnosis
     DWORD now_tick = GetTickCount();
     if (s_last_draw_tick > 0) {
@@ -1359,8 +1710,8 @@ void draw() {
     }
     s_last_draw_tick = now_tick;
 
-    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d cache=%zu gap=%lums #%u",
-        w2s_ok, w2s_fail, drawn, skel_drawn,
+    snprintf(dbg, sizeof(dbg), "ESP: ok=%d fail=%d drawn=%d skel=%d hb=%d cache=%zu gap=%lums #%u",
+        w2s_ok, w2s_fail, drawn, skel_drawn, hb_drawn,
         s_skeleton_cache.size(), s_max_gap_ms, s_esp_frame);
     s_esp_debug = dbg;
     if (!s_bone_debug.empty()) {
@@ -1379,6 +1730,8 @@ void set_enabled(bool enabled) { s_enabled = enabled; }
 bool is_enabled() { return s_enabled; }
 void set_skeleton_enabled(bool enabled) { s_skeleton_enabled = enabled; }
 bool is_skeleton_enabled() { return s_skeleton_enabled; }
+void set_hitbox_enabled(bool enabled) { s_hitbox_enabled = enabled; }
+bool is_hitbox_enabled() { return s_hitbox_enabled; }
 
 // ---------------------------------------------------------------------------
 // Shutdown -- free GC handle and null texture, clear skeleton cache

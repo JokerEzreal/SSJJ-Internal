@@ -13,6 +13,10 @@ void update();
 void set_enabled(bool enabled);
 bool is_enabled();
 
+// Silent mode: bullets go to target, camera stays at real mouse direction
+void set_silent(bool silent);
+bool is_silent();
+
 // Debug info
 const char* get_debug_info();
 
