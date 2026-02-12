@@ -32,7 +32,11 @@ static struct {
 static struct {
     MonoMethod* Contexts_get_sharedInstance    = nullptr;
     MonoMethod* Contexts_get_userCommand       = nullptr;
-    MonoMethod* UserCommandCtx_get_limitYaw    = nullptr;
+    // YawLimit is on UserCommandEntity, NOT UserCommandContext.
+    // Path: UserCommandContext -> inputEntity -> UserCommandEntity -> limitYawSpeed
+    MonoMethod* UCCtx_get_inputEntity          = nullptr;  // -> UserCommandEntity
+    MonoMethod* UCEntity_get_hasLimitYaw       = nullptr;  // -> bool
+    MonoMethod* UCEntity_get_limitYaw          = nullptr;  // -> LimitYawSpeedComponent
     MonoMethod* Contexts_get_battleRoom        = nullptr;
     MonoMethod* BattleRoomCtx_get_ace          = nullptr;
     MonoMethod* BattleRoomCtx_get_hasAce       = nullptr;
@@ -147,9 +151,17 @@ bool initialize() {
     }
 
     if (UserCommandContext) {
-        // Try to find the getter for limitYawSpeed component
-        s_methods.UserCommandCtx_get_limitYaw =
-            mono::class_get_method_from_name(UserCommandContext, "get_limitYawSpeed", 0);
+        s_methods.UCCtx_get_inputEntity =
+            mono::class_get_method_from_name(UserCommandContext, "get_inputEntity", 0);
+    }
+
+    // limitYawSpeed lives on UserCommandEntity, not UserCommandContext
+    MonoClass* UserCommandEntity = mono::class_from_name(ent_img, "", "UserCommandEntity");
+    if (UserCommandEntity) {
+        s_methods.UCEntity_get_hasLimitYaw =
+            mono::class_get_method_from_name(UserCommandEntity, "get_hasLimitYawSpeed", 0);
+        s_methods.UCEntity_get_limitYaw =
+            mono::class_get_method_from_name(UserCommandEntity, "get_limitYawSpeed", 0);
     }
 
     if (BattleRoomContext) {
@@ -210,14 +222,28 @@ void update() {
     if (!contexts) return;
 
     // ------ Patch 1: Remove yaw speed limit (anti-aimbot bypass) ------
-    if (s_methods.UserCommandCtx_get_limitYaw && s_fields.LimitYaw_Yaw) {
+    // Path: Contexts -> userCommand -> inputEntity -> hasLimitYawSpeed -> limitYawSpeed.Yaw
+    if (s_methods.UCCtx_get_inputEntity && s_methods.UCEntity_get_limitYaw &&
+        s_fields.LimitYaw_Yaw) {
         MonoObject* uc_ctx = invoke_safe(s_methods.Contexts_get_userCommand, contexts);
         if (uc_ctx) {
-            MonoObject* limit_comp = invoke_safe(s_methods.UserCommandCtx_get_limitYaw, uc_ctx);
-            if (limit_comp) {
-                float big_yaw = 99999.0f;
-                mono::field_set_value(limit_comp, s_fields.LimitYaw_Yaw, &big_yaw);
-                s_yaw_patch_count++;
+            MonoObject* uc_entity = invoke_safe(s_methods.UCCtx_get_inputEntity, uc_ctx);
+            if (uc_entity) {
+                // Check hasLimitYawSpeed first to avoid exception
+                bool has_limit = true;
+                if (s_methods.UCEntity_get_hasLimitYaw) {
+                    MonoObject* has_res = invoke_safe(s_methods.UCEntity_get_hasLimitYaw, uc_entity);
+                    if (has_res) has_limit = *static_cast<bool*>(mono::object_unbox(has_res));
+                    else has_limit = false;
+                }
+                if (has_limit) {
+                    MonoObject* limit_comp = invoke_safe(s_methods.UCEntity_get_limitYaw, uc_entity);
+                    if (limit_comp) {
+                        float big_yaw = 99999.0f;
+                        mono::field_set_value(limit_comp, s_fields.LimitYaw_Yaw, &big_yaw);
+                        s_yaw_patch_count++;
+                    }
+                }
             }
         }
     }
@@ -242,11 +268,11 @@ void update() {
                     bool no_refresh = false;
                     mono::field_set_value(ace_comp, s_fields.Ace_IsRefresh, &no_refresh);
 
-                    // Clear the AntiJObject (null out the data)
-                    if (s_fields.Ace_AntiJObject) {
-                        MonoObject* null_obj = nullptr;
-                        mono::field_set_value(ace_comp, s_fields.Ace_AntiJObject, &null_obj);
-                    }
+                    // NOTE: Do NOT null out AntiJObject here.  Writing null to a
+                    // managed reference field from C++ while the Boehm GC is
+                    // concurrently scanning can corrupt the object graph and crash
+                    // inside mono_unity_liveness_calculation_from_statics.
+                    // Setting IsRefresh=false is sufficient to suppress ACE reports.
                     s_ace_patch_count++;
                 }
             }
@@ -267,9 +293,10 @@ std::string dump_diagnostics() {
     snprintf(buf, sizeof(buf), "initialized=%d\n", s_initialized);
     out += buf;
 
-    snprintf(buf, sizeof(buf), "LimitYawSpeed: class=%p field=%p getter=%p patches=%d\n",
+    snprintf(buf, sizeof(buf), "LimitYawSpeed: class=%p field=%p entity_get=%p has=%p patches=%d\n",
         s_classes.LimitYawSpeedComponent, s_fields.LimitYaw_Yaw,
-        s_methods.UserCommandCtx_get_limitYaw, s_yaw_patch_count);
+        s_methods.UCEntity_get_limitYaw, s_methods.UCEntity_get_hasLimitYaw,
+        s_yaw_patch_count);
     out += buf;
 
     snprintf(buf, sizeof(buf), "ACE: class=%p isRefresh=%p getter=%p patches=%d\n",

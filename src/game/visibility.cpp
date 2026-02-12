@@ -28,6 +28,7 @@ static struct {
     MonoMethod* BspTrace_ctor                 = nullptr; // BspTrace(BspClipMapEx)
     MonoMethod* Trace_ctor                    = nullptr;
     MonoMethod* Trace_Reset                   = nullptr;
+    MonoMethod* ClipMapEx_get_numNodes        = nullptr;
 } s_methods;
 
 static struct {
@@ -38,9 +39,10 @@ static struct {
 } s_fields;
 
 static struct {
-    MonoClass* Trace      = nullptr;
-    MonoClass* BspTrace   = nullptr;
-    MonoClass* BspEngine  = nullptr;
+    MonoClass* Trace       = nullptr;
+    MonoClass* BspTrace    = nullptr;
+    MonoClass* BspEngine   = nullptr;
+    MonoClass* BspClipMapEx = nullptr;
 } s_classes;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +64,13 @@ static int         s_fail_count     = 0;
 static constexpr int MAX_RETRIES    = 60;
 static std::string s_debug;
 
+// Staleness detection
+static MonoObject* s_cached_clip_map = nullptr;  // clipMap used when creating our BspTrace
+static int         s_stale_counter   = 0;         // periodic staleness check counter
+static int         s_last_num_nodes  = -1;        // cached numNodes for diagnostics
+static float       s_last_fractions[8] = {};      // ring buffer of recent trace fractions
+static int         s_frac_idx        = 0;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -76,6 +85,20 @@ static float* array_data(MonoArray* arr) {
 static MonoObject* invoke_safe(MonoMethod* method, MonoObject* obj, MonoObject** exc) {
     if (!method) return nullptr;
     return mono::runtime_invoke(method, obj, nullptr, exc);
+}
+
+// ---------------------------------------------------------------------------
+// Release cached managed objects (allows recreation on next call)
+// ---------------------------------------------------------------------------
+static void release_cached_objects() {
+    if (s_bsp_trace_gc) { mono::gchandle_free(s_bsp_trace_gc); s_bsp_trace_gc = 0; }
+    if (s_trace_gc) { mono::gchandle_free(s_trace_gc); s_trace_gc = 0; }
+    for (auto& gc : s_arr_gc) { if (gc) { mono::gchandle_free(gc); gc = 0; } }
+    s_own_bsp_trace = nullptr;
+    s_trace_result = nullptr;
+    s_arr_start = s_arr_end = s_arr_mins = s_arr_maxs = nullptr;
+    s_cached_clip_map = nullptr;
+    s_last_num_nodes = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +182,23 @@ static bool create_cached_objects() {
     MonoObject* clip_map = get_clip_map();
     if (!clip_map) { s_debug = "VIS: no clipMap (not in match?)"; return false; }
 
+    // Check if clipMap actually has BSP data loaded
+    if (s_methods.ClipMapEx_get_numNodes) {
+        MonoObject* exc2 = nullptr;
+        MonoObject* nn_res = mono::runtime_invoke(
+            s_methods.ClipMapEx_get_numNodes, clip_map, nullptr, &exc2);
+        if (nn_res && !exc2) {
+            s_last_num_nodes = *static_cast<int*>(mono::object_unbox(nn_res));
+        }
+        if (s_last_num_nodes <= 0) {
+            char buf2[128];
+            snprintf(buf2, sizeof(buf2), "VIS: clipMap numNodes=%d (map loading?)",
+                s_last_num_nodes);
+            s_debug = buf2;
+            return false;  // retry later - map data not ready yet
+        }
+    }
+
     if (!s_classes.BspTrace || !s_methods.BspTrace_ctor) {
         s_debug = "VIS: BspTrace class/ctor null";
         return false;
@@ -184,9 +224,11 @@ static bool create_cached_objects() {
     if (s_fields.BspTrace_cm)
         mono::field_get_value(s_own_bsp_trace, s_fields.BspTrace_cm, &cm_check);
 
+    s_cached_clip_map = clip_map;
+
     char buf[256];
-    snprintf(buf, sizeof(buf), "VIS: ready (own BspTrace=%p cm=%p)",
-        s_own_bsp_trace, cm_check);
+    snprintf(buf, sizeof(buf), "VIS: ready (BspTrace=%p cm=%p nodes=%d)",
+        s_own_bsp_trace, cm_check, s_last_num_nodes);
     s_debug = buf;
     return true;
 }
@@ -213,8 +255,9 @@ bool initialize() {
     }
 
     if (phy_img) {
-        s_classes.BspEngine = mono::class_from_name(phy_img, "SSJJPhysics", "BspEngine");
-        s_classes.BspTrace  = mono::class_from_name(phy_img, "SSJJPhysics", "BspTrace");
+        s_classes.BspEngine    = mono::class_from_name(phy_img, "SSJJPhysics", "BspEngine");
+        s_classes.BspTrace     = mono::class_from_name(phy_img, "SSJJPhysics", "BspTrace");
+        s_classes.BspClipMapEx = mono::class_from_name(phy_img, "SSJJPhysics", "BspClipMapEx");
     }
     if (pnet_img) {
         s_classes.Trace = mono::class_from_name(pnet_img, "physics.trace", "Trace");
@@ -247,6 +290,11 @@ bool initialize() {
             mono::class_get_method_from_name(s_classes.BspTrace, ".ctor", 1);
         s_fields.BspTrace_cm =
             mono::class_get_field_from_name(s_classes.BspTrace, "cm");
+    }
+
+    if (s_classes.BspClipMapEx) {
+        s_methods.ClipMapEx_get_numNodes =
+            mono::class_get_method_from_name(s_classes.BspClipMapEx, "get_numNodes", 0);
     }
 
     if (s_classes.Trace) {
@@ -283,14 +331,27 @@ bool initialize() {
 // ---------------------------------------------------------------------------
 bool is_visible_ssjj(const unity::Vector3& from_ssjj, const unity::Vector3& to_ssjj) {
     if (!s_initialized) return true;
+
+    // Periodic staleness check: has the game's clipMap changed? (every ~120 calls)
+    if (++s_stale_counter >= 120) {
+        s_stale_counter = 0;
+        MonoObject* current_cm = get_clip_map();
+        if (current_cm && current_cm != s_cached_clip_map) {
+            // ClipMap changed (new map loaded) — force recreation
+            release_cached_objects();
+            s_fail_count = 0;
+        }
+    }
+
     if (s_fail_count >= MAX_RETRIES) return true;
 
-    // Lazy-create on first call
+    // Lazy-create on first call (or after clipMap change)
     if (!s_trace_result || !s_own_bsp_trace) {
         if (!create_cached_objects()) {
-            s_fail_count = MAX_RETRIES; // don't retry until next map
+            s_fail_count++;  // retry up to MAX_RETRIES times
             return true;
         }
+        s_fail_count = 0;
     }
 
     if (!s_methods.BspTrace_WorldTrace) return true;
@@ -336,6 +397,10 @@ bool is_visible_ssjj(const unity::Vector3& from_ssjj, const unity::Vector3& to_s
     float fraction = 0.0f;
     if (s_fields.Trace_fraction)
         mono::field_get_value(s_trace_result, s_fields.Trace_fraction, &fraction);
+
+    // Track recent fractions for diagnostics
+    s_last_fractions[s_frac_idx % 8] = fraction;
+    s_frac_idx++;
 
     return fraction >= 1.0f;
 }
@@ -390,6 +455,36 @@ std::string dump_diagnostics() {
         mono::field_get_value(s_own_bsp_trace, s_fields.BspTrace_cm, &cm);
         snprintf(buf, sizeof(buf), "own BspTrace.cm=%p\n", cm);
         out += buf;
+    }
+
+    // Show numNodes from both game clipMap and our cached one
+    snprintf(buf, sizeof(buf), "cached_numNodes=%d cached_cm=%p\n",
+        s_last_num_nodes, s_cached_clip_map);
+    out += buf;
+
+    if (clip_map && s_methods.ClipMapEx_get_numNodes) {
+        MonoObject* exc = nullptr;
+        MonoObject* nn_res = mono::runtime_invoke(
+            s_methods.ClipMapEx_get_numNodes, clip_map, nullptr, &exc);
+        int live_nodes = -1;
+        if (nn_res && !exc) live_nodes = *static_cast<int*>(mono::object_unbox(nn_res));
+        snprintf(buf, sizeof(buf), "live clipMap numNodes=%d\n", live_nodes);
+        out += buf;
+    }
+
+    // Show recent trace fractions
+    {
+        int count = s_frac_idx < 8 ? s_frac_idx : 8;
+        out += "recent fractions: [";
+        for (int i = 0; i < count; i++) {
+            int idx = (s_frac_idx - count + i) % 8;
+            if (idx < 0) idx += 8;
+            char fb[16];
+            snprintf(fb, sizeof(fb), "%.3f", s_last_fractions[idx]);
+            if (i > 0) out += ", ";
+            out += fb;
+        }
+        out += "]\n";
     }
 
     // Check Trace fields
@@ -452,17 +547,15 @@ std::string dump_diagnostics() {
 const char* get_debug_info() { return s_debug.c_str(); }
 
 void shutdown() {
-    if (s_bsp_trace_gc) { mono::gchandle_free(s_bsp_trace_gc); s_bsp_trace_gc = 0; }
-    if (s_trace_gc) { mono::gchandle_free(s_trace_gc); s_trace_gc = 0; }
-    for (auto& gc : s_arr_gc) { if (gc) { mono::gchandle_free(gc); gc = 0; } }
-    s_own_bsp_trace = nullptr;
-    s_trace_result = nullptr;
-    s_arr_start = s_arr_end = s_arr_mins = s_arr_maxs = nullptr;
+    release_cached_objects();
     s_methods = {};
     s_fields = {};
     s_classes = {};
     s_initialized = false;
     s_fail_count = 0;
+    s_stale_counter = 0;
+    s_last_num_nodes = -1;
+    s_frac_idx = 0;
 }
 
 } // namespace visibility

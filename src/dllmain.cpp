@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "core/globals.h"
+#include "core/crash_handler.h"
 #include "mono/mono_api.h"
 #include "unity/unity_classes.h"
 #include "gui/gui.h"
@@ -14,6 +15,9 @@
 
 static DWORD WINAPI init_thread(LPVOID param)
 {
+    // Install crash handler first so we catch any crash during init
+    crash_handler::install();
+
     // Wait for mono to be ready
     while (!GetModuleHandleA("mono-2.0-bdwgc.dll") && !GetModuleHandleA("mono.dll")) {
         Sleep(100);
@@ -116,6 +120,7 @@ static DWORD WINAPI init_thread(LPVOID param)
     hooks::shutdown();
     unity::cache_shutdown();
     mono::shutdown();
+    crash_handler::uninstall();
 
     FreeLibraryAndExitThread(globals::dll_handle, 0);
     return 0;

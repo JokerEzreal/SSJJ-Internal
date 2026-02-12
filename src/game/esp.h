@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../unity/unity_types.h"
+#include <string>
 
 // Forward declaration
 struct _MonoObject;
@@ -29,6 +30,9 @@ const char* get_esp_debug();
 // Bone hierarchy dump for data export
 const char* get_bone_dump();
 void request_bone_dump();
+
+// Per-player skeleton summary for dump (call from OnGUI thread)
+std::string dump_per_player_skeleton();
 
 // Get head bone world position (Unity coords) for a player entity.
 // Returns false if skeleton data unavailable (falls back to estimated).

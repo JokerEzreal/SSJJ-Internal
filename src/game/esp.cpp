@@ -756,7 +756,188 @@ int get_bone_targets(MonoObject* player_entity,
         count++;
     }
 
+    // Fallback for models with obfuscated bone names (e.g., pandora_t/ct):
+    // Use ThirdTran.HeadTransform and BodyTransform directly as head + body targets
+    if (count == 0 && third_tran) {
+        MonoObject* head_tf = nullptr;
+        MonoObject* body_tf = nullptr;
+        if (s_skel.TT_HeadTransform)
+            mono::field_get_value(third_tran, s_skel.TT_HeadTransform, &head_tf);
+        if (s_skel.TT_BodyTransform)
+            mono::field_get_value(third_tran, s_skel.TT_BodyTransform, &body_tf);
+
+        if (head_tf && BONE_HEAD < limit) {
+            unity::Vector3 pos;
+            if (get_transform_position(head_tf, pos)) {
+                out[BONE_HEAD].world_pos = pos;
+                out[BONE_HEAD].valid = true;
+                out[BONE_HEAD].visible = visibility::is_visible_unity(eye_unity, pos);
+                out[BONE_HEAD].bone_id = BONE_HEAD;
+                count++;
+            }
+        }
+        if (body_tf && BONE_SPINE1 < limit) {
+            unity::Vector3 pos;
+            if (get_transform_position(body_tf, pos)) {
+                out[BONE_SPINE1].world_pos = pos;
+                out[BONE_SPINE1].valid = true;
+                out[BONE_SPINE1].visible = visibility::is_visible_unity(eye_unity, pos);
+                out[BONE_SPINE1].bone_id = BONE_SPINE1;
+                count++;
+            }
+        }
+    }
+
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// Per-player skeleton summary for dump
+// ---------------------------------------------------------------------------
+static const char* bone_id_name(BoneId id) {
+    static const char* names[] = {
+        "Head", "Neck", "Spine2", "Spine1", "Spine", "Pelvis",
+        "L_Clav", "R_Clav", "L_UpArm", "R_UpArm", "L_FoArm", "R_FoArm",
+        "L_Hand", "R_Hand", "L_Thigh", "R_Thigh", "L_Calf", "R_Calf",
+        "L_Foot", "R_Foot"
+    };
+    if (id >= 0 && id < BONE_COUNT) return names[id];
+    return "?";
+}
+
+std::string dump_per_player_skeleton() {
+    init_skeleton_cache();
+    std::string out;
+    char buf[512];
+
+    auto players = player_info::read_all_players();
+    for (const auto& p : players) {
+        if (!p.valid || p.is_local || !p._raw_entity) continue;
+
+        snprintf(buf, sizeof(buf), "\n--- %s (EID:%d Team:%d) ---\n",
+            p.name.c_str(), p.entity_id, p.team_id);
+        out += buf;
+
+        // Check hasThirdPersonUnityObjects
+        if (!s_skel.PE_get_hasThirdPersonUnityObjects ||
+            !s_skel.PE_get_thirdPersonUnityObjects) {
+            out += "  (skeleton cache not initialized)\n";
+            continue;
+        }
+
+        MonoObject* has_res = invoke_safe(
+            s_skel.PE_get_hasThirdPersonUnityObjects, p._raw_entity);
+        if (!has_res || !*static_cast<bool*>(mono::object_unbox(has_res))) {
+            out += "  (no ThirdPersonUnityObjects)\n";
+            continue;
+        }
+
+        MonoObject* tpu = invoke_safe(
+            s_skel.PE_get_thirdPersonUnityObjects, p._raw_entity);
+        if (!tpu || !s_skel.TPU_ThirdTran) {
+            out += "  (no TPU component)\n";
+            continue;
+        }
+
+        MonoObject* third_tran = nullptr;
+        mono::field_get_value(tpu, s_skel.TPU_ThirdTran, &third_tran);
+        if (!third_tran) {
+            out += "  (ThirdTran null)\n";
+            continue;
+        }
+
+        // Resolve fields if needed
+        if (!s_skel.fields_resolved && mono::object_get_class) {
+            MonoClass* tt_cls = mono::object_get_class(third_tran);
+            if (tt_cls) {
+                s_skel.TT_HeadTransform = mono::class_get_field_from_name(tt_cls, "HeadTransform");
+                s_skel.TT_BodyTransform = mono::class_get_field_from_name(tt_cls, "BodyTransform");
+                s_skel.TT_RootContainer = mono::class_get_field_from_name(tt_cls, "RootContainer");
+                s_skel.fields_resolved = true;
+            }
+        }
+
+        MonoObject* root_go = nullptr;
+        if (s_skel.TT_RootContainer)
+            mono::field_get_value(third_tran, s_skel.TT_RootContainer, &root_go);
+        if (!root_go) {
+            out += "  (RootContainer null)\n";
+            continue;
+        }
+
+        MonoMethod* get_tf = unity::methods().GameObject_get_transform;
+        if (!get_tf) { out += "  (no get_transform)\n"; continue; }
+        MonoObject* root_tf = invoke_safe(get_tf, root_go);
+        if (!root_tf) { out += "  (root transform null)\n"; continue; }
+
+        // Collect bones
+        MonoObject* bones[BONE_COUNT] = {};
+        int found = 0;
+        collect_bones(root_tf, bones, 0, 15, found);
+
+        snprintf(buf, sizeof(buf), "  bones found: %d/%d\n", found, BONE_COUNT);
+        out += buf;
+
+        // List found bones
+        out += "  found: ";
+        bool first = true;
+        for (int i = 0; i < BONE_COUNT; i++) {
+            if (bones[i]) {
+                if (!first) out += ", ";
+                out += bone_id_name((BoneId)i);
+                first = false;
+            }
+        }
+        out += "\n";
+
+        // List missing bones
+        out += "  missing: ";
+        first = true;
+        for (int i = 0; i < BONE_COUNT; i++) {
+            if (!bones[i]) {
+                if (!first) out += ", ";
+                out += bone_id_name((BoneId)i);
+                first = false;
+            }
+        }
+        out += "\n";
+
+        // If bones < 10, dump first 3 levels of hierarchy to see naming
+        if (found < 10) {
+            out += "  hierarchy (first 3 levels):\n";
+            // Walk root's first skeleton child
+            int cc = get_child_count(root_tf);
+            for (int c = 0; c < cc && c < 5; c++) {
+                MonoObject* child = get_child(root_tf, c);
+                if (!child) continue;
+                std::string cname = get_transform_name(child);
+                snprintf(buf, sizeof(buf), "    %s\n", cname.c_str());
+                out += buf;
+                // Level 2
+                int cc2 = get_child_count(child);
+                for (int d = 0; d < cc2 && d < 5; d++) {
+                    MonoObject* grandchild = get_child(child, d);
+                    if (!grandchild) continue;
+                    std::string gname = get_transform_name(grandchild);
+                    snprintf(buf, sizeof(buf), "      %s\n", gname.c_str());
+                    out += buf;
+                    // Level 3
+                    int cc3 = get_child_count(grandchild);
+                    for (int e = 0; e < cc3 && e < 5; e++) {
+                        MonoObject* ggc = get_child(grandchild, e);
+                        if (!ggc) continue;
+                        std::string ggname = get_transform_name(ggc);
+                        snprintf(buf, sizeof(buf), "        %s\n", ggname.c_str());
+                        out += buf;
+                    }
+                    if (cc3 > 5) { out += "        ... (more)\n"; }
+                }
+                if (cc2 > 5) { out += "      ... (more)\n"; }
+            }
+        }
+    }
+
+    return out;
 }
 
 // Frame counter for stale detection in debug display

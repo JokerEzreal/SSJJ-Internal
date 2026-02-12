@@ -167,6 +167,11 @@ static void dump_data_to_file() {
     }
     f << "\n";
 
+    // --- Per-player skeleton summary ---
+    f << "=== PER-PLAYER SKELETON ===\n";
+    f << esp::dump_per_player_skeleton();
+    f << "\n";
+
     // --- Debug strings ---
     f << "=== DEBUG INFO ===\n";
     f << "PlayerInfo: " << player_info::get_debug_info() << "\n";
