@@ -17,6 +17,10 @@ bool is_enabled();
 void set_silent(bool silent);
 bool is_silent();
 
+// Auto-fire: automatically fire when silent aimbot has a target
+void set_auto_fire(bool auto_fire);
+bool is_auto_fire();
+
 // Debug info
 const char* get_debug_info();
 

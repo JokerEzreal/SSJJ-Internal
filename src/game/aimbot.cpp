@@ -9,6 +9,7 @@
 #include "../unity/unity_types.h"
 #include "../gui/gui.h"
 
+#include <Windows.h>
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -29,16 +30,23 @@ static constexpr float EYE_HEIGHT  = 150.0f;   // local eye/camera above feet
 // Maximum angular distance (degrees) from crosshair to consider a target
 static constexpr float AIM_FOV = 90.0f;
 
-// Unity KeyCode values for mouse side buttons
+// Unity KeyCode values for mouse buttons
 static constexpr int KEYCODE_MOUSE3 = 326;
 static constexpr int KEYCODE_MOUSE4 = 327;
+
+// ButtonConstant.Attack bitmask (key in InputComponent.KeyStates dictionary)
+static constexpr int BUTTON_ATTACK = 64;
 
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
-static bool        s_enabled = true;
-static bool        s_silent  = true;     // silent mode on by default
+static bool        s_enabled    = true;
+static bool        s_silent     = true;     // silent mode on by default
+static bool        s_auto_fire  = true;     // auto-fire in silent mode
 static std::string s_debug;
+
+// Auto-fire state: track whether WE forced the attack key so we can clear it
+static bool        s_forced_fire = false;
 
 // Silent-mode state
 static bool   s_tracking           = false; // actively tracking real mouse
@@ -252,6 +260,20 @@ static void write_orientation(MonoObject* pe, float yaw, float pitch) {
     if (!ori) return;
     if (s_fields.Orientation_Yaw)   mono::field_set_value(ori, s_fields.Orientation_Yaw, &yaw);
     if (s_fields.Orientation_Pitch) mono::field_set_value(ori, s_fields.Orientation_Pitch, &pitch);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-fire: simulate left mouse button via Windows API
+// This injects a real OS-level mouse event that Unity reads on next frame.
+// ---------------------------------------------------------------------------
+static void set_auto_fire_state(bool fire) {
+    if (fire && !s_forced_fire) {
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        s_forced_fire = true;
+    } else if (!fire && s_forced_fire) {
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        s_forced_fire = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -528,22 +550,29 @@ static void apply_aimbot() {
         }
 
         // 1. Write angles to InputComponent
+        //    Always write target angles when a target exists — bullets always
+        //    hit the closest-to-crosshair enemy. Real-time target switching
+        //    every frame (no locking).
         if (found) {
-            // Target acquired: write target angles → server hit detection
             write_input(input, aim_yaw, aim_pitch);
             s_prev_aim_yaw   = aim_yaw;
             s_prev_aim_pitch = aim_pitch;
         } else {
-            // No target: write real angles → smooth natural control, no snap
+            // No target: write real angles → natural behavior
             write_input(input, s_real_yaw, s_real_pitch);
             s_prev_aim_yaw   = s_real_yaw;
             s_prev_aim_pitch = s_real_pitch;
         }
 
-        // 2. Write real to OrientationComponent (player model / first-person weapon)
+        // 2. Auto-fire: simulate mouse click when target found
+        if (s_auto_fire) {
+            set_auto_fire_state(found);
+        }
+
+        // 3. Write real to OrientationComponent (player model / first-person weapon)
         write_orientation(pe, s_real_yaw, s_real_pitch);
 
-        // 3. Override camera Transform to show the real mouse direction.
+        // 4. Override camera Transform to show the real mouse direction.
         //    This runs in LateUpdate, right before rendering — final word.
         if (s_cam_calibrated) {
             unity::Vector3 cam_euler = {0, 0, 0};
@@ -569,13 +598,13 @@ static void apply_aimbot() {
 
     if (found) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "AIM%s: -> %s [%s] (%.1f deg) punch=(%.1f,%.1f)",
+        snprintf(buf, sizeof(buf), "AIM%s%s: -> %s [%s] (%.1f deg)",
             s_silent ? " [S]" : "",
-            target_name.c_str(), target_bone_name.c_str(), best_dist,
-            punch_yaw, punch_pitch);
+            (s_silent && s_auto_fire) ? " FIRE" : "",
+            target_name.c_str(), target_bone_name.c_str(), best_dist);
         s_debug = buf;
     } else {
-        s_debug = "AIM [S]: scanning...";
+        s_debug = s_silent ? "AIM [S]: no target" : "AIM: no visible target";
     }
 }
 
@@ -593,28 +622,33 @@ void update() {
             s_tracking = false;
             s_cam_calibrated = false;
         }
+        set_auto_fire_state(false);  // release mouse if forced
         s_debug = "";
         return;
     }
 
-    // Activate aimbot while mouse side button is held
-    // Mouse3 (KeyCode 326) = thumb back button
-    bool active = gui::get_key(KEYCODE_MOUSE3);
-    if (!active) {
-        // Key released — hand back control to real mouse direction
-        if (s_tracking) {
-            MonoObject* input = get_input_component();
-            if (input) write_input(input, s_real_yaw, s_real_pitch);
-            MonoObject* pe = get_local_player_entity();
-            if (pe) write_orientation(pe, s_real_yaw, s_real_pitch);
-            s_tracking = false;
-            s_cam_calibrated = false;
+    if (s_silent) {
+        // Silent mode: always active, no hotkey required.
+        // Tracking runs continuously; target angles only written on left-click.
+        apply_aimbot();
+    } else {
+        // Normal mode: activate aimbot while Mouse3 is held
+        bool active = gui::get_key(KEYCODE_MOUSE3);
+        if (!active) {
+            // Key released — hand back control to real mouse direction
+            if (s_tracking) {
+                MonoObject* input = get_input_component();
+                if (input) write_input(input, s_real_yaw, s_real_pitch);
+                MonoObject* pe = get_local_player_entity();
+                if (pe) write_orientation(pe, s_real_yaw, s_real_pitch);
+                s_tracking = false;
+                s_cam_calibrated = false;
+            }
+            s_debug = "AIM: ready [Mouse3]";
+            return;
         }
-        s_debug = s_silent ? "AIM: ready [Mouse3] [Silent]" : "AIM: ready [Mouse3]";
-        return;
+        apply_aimbot();
     }
-
-    apply_aimbot();
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +658,8 @@ void set_enabled(bool e) { s_enabled = e; }
 bool is_enabled()        { return s_enabled; }
 void set_silent(bool s)  { s_silent = s; }
 bool is_silent()         { return s_silent; }
+void set_auto_fire(bool a) { s_auto_fire = a; }
+bool is_auto_fire()      { return s_auto_fire; }
 const char* get_debug_info() { return s_debug.c_str(); }
 
 void shutdown() {
@@ -632,7 +668,9 @@ void shutdown() {
     s_fields  = {};
     s_enabled = false;
     s_silent  = true;
+    s_auto_fire = true;
     s_tracking = false;
+    s_forced_fire = false;
     s_cam_calibrated = false;
 }
 

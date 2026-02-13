@@ -22,9 +22,6 @@ namespace Payload
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern void OnUpdateCallback();
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern void OnAntiCheatCallback();
-
         // --- LateUpdate (post-frame) ---
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern void OnLateUpdateCallback();
@@ -73,9 +70,6 @@ namespace Payload
         void Update()
         {
             try { Bridge.OnUpdateCallback(); }
-            catch (System.Exception) { }
-
-            try { Bridge.OnAntiCheatCallback(); }
             catch (System.Exception) { }
         }
 

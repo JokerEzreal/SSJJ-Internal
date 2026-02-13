@@ -11,13 +11,15 @@
 #include "game/esp.h"
 #include "game/aimbot.h"
 #include "game/visibility.h"
-#include "game/anticheat.h"
 #include "game/frame_cache.h"
 
 static DWORD WINAPI init_thread(LPVOID param)
 {
-    // Install crash handler first so we catch any crash during init
-    crash_handler::install();
+    // Step 0: Hide our DLL IMMEDIATELY before any anti-cheat scan can find us.
+    // This hooks NtReadVirtualMemory, unlinks from PEB, and erases our PE header.
+    hooks::install_stealth();
+
+    // crash_handler::install();  // Disabled: no longer write crash logs to Desktop
 
     // Wait for mono to be ready
     while (!GetModuleHandleA("mono-2.0-bdwgc.dll") && !GetModuleHandleA("mono.dll")) {
@@ -66,9 +68,6 @@ static DWORD WINAPI init_thread(LPVOID param)
     // Step 8c: Initialize visibility (BspTrace raycast)
     visibility::initialize();
 
-    // Step 8d: Initialize anti-cheat bypass
-    anticheat::initialize();
-
     // Step 9: Load and execute C# payload
     if (!payload::initialize()) {
         MessageBoxA(nullptr, "Failed to load payload", "SSJJ-Internal", MB_OK | MB_ICONERROR);
@@ -114,7 +113,6 @@ static DWORD WINAPI init_thread(LPVOID param)
     // Cleanup
     payload::shutdown();
     frame_cache::shutdown();
-    anticheat::shutdown();
     visibility::shutdown();
     aimbot::shutdown();
     esp::shutdown();
@@ -124,7 +122,16 @@ static DWORD WINAPI init_thread(LPVOID param)
     mono::shutdown();
     crash_handler::uninstall();
 
-    FreeLibraryAndExitThread(globals::dll_handle, 0);
+    // Manual-mapped DLLs are not in the loader's module list, so FreeLibrary
+    // would fail. Detect this and use ExitThread instead.
+    HMODULE check = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)globals::dll_handle, &check) && check) {
+        FreeLibraryAndExitThread(globals::dll_handle, 0);
+    } else {
+        ExitThread(0);
+    }
     return 0;
 }
 

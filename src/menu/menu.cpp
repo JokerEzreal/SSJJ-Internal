@@ -5,7 +5,6 @@
 #include "../game/esp.h"
 #include "../game/aimbot.h"
 #include "../game/visibility.h"
-#include "../game/anticheat.h"
 #include "../core/globals.h"
 
 #include <cstdio>
@@ -192,10 +191,6 @@ static void dump_data_to_file() {
     f << visibility::dump_diagnostics();
     f << "\n";
 
-    f << "=== ANTI-CHEAT BYPASS DIAGNOSTICS ===\n";
-    f << anticheat::dump_diagnostics();
-    f << "\n";
-
     // --- Reference: ECS component indices ---
     f << "=== COMPONENT INDICES (for reference) ===\n";
     f << "BasicInfo=17, Life=4, Orientation=6, Fpos=51\n";
@@ -261,6 +256,11 @@ void on_update() {
     // Toggle aimbot silent mode
     if (gui::get_key_down(gui::keycode::F5)) {
         aimbot::set_silent(!aimbot::is_silent());
+    }
+
+    // Toggle auto-fire
+    if (gui::get_key_down(gui::keycode::F6)) {
+        aimbot::set_auto_fire(!aimbot::is_auto_fire());
     }
 
     // Refresh player data every ~15 frames
@@ -351,9 +351,17 @@ void on_gui_menu() {
         // Aimbot silent mode toggle
         if (aim_on) {
             bool silent = gui::toggle({x + 20, y, w - 20, LINE_H}, aimbot::is_silent(),
-                "Silent Aim  [F5]");
+                "Silent Aim [Auto]  [F5]");
             aimbot::set_silent(silent);
             y += LINE_H + GAP;
+
+            // Auto-fire toggle (only visible when silent mode is on)
+            if (silent) {
+                bool af = gui::toggle({x + 40, y, w - 40, LINE_H}, aimbot::is_auto_fire(),
+                    "Auto Fire  [F6]");
+                aimbot::set_auto_fire(af);
+                y += LINE_H + GAP;
+            }
 
             // Aimbot status
             const char* aim_dbg = aimbot::get_debug_info();
@@ -480,12 +488,6 @@ void on_gui_menu() {
         const char* vis_dbg = visibility::get_debug_info();
         if (vis_dbg && vis_dbg[0]) {
             gui::label({x, y, w, LINE_H}, fmt("VIS: %s", vis_dbg));
-            y += LINE_H + GAP;
-        }
-
-        const char* ac_dbg = anticheat::get_debug_info();
-        if (ac_dbg && ac_dbg[0]) {
-            gui::label({x, y, w, LINE_H}, fmt("AC: %s", ac_dbg));
             y += LINE_H + GAP;
         }
 

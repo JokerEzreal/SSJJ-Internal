@@ -15,3 +15,6 @@ add_library(ssjj_overlay SHARED ${DLL_SOURCES} ${DLL_HEADERS})
 target_include_directories(ssjj_overlay PRIVATE src)
 target_link_libraries(ssjj_overlay PRIVATE user32 kernel32)
 
+# Manual map injector
+add_executable(injector tools/manual_map_injector.cpp)
+target_compile_options(injector PRIVATE /GS- /O2)

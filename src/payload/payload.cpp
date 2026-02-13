@@ -6,7 +6,6 @@
 #include "../menu/menu.h"
 #include "../game/esp.h"
 #include "../game/aimbot.h"
-#include "../game/anticheat.h"
 #include "../game/frame_cache.h"
 
 #include <cstdio>
@@ -48,12 +47,6 @@ static void __cdecl on_update_callback()
     menu::on_update();
 }
 
-// Called from C# Update — second try-catch block
-static void __cdecl on_anticheat_callback()
-{
-    anticheat::update();
-}
-
 // Called from C# LateUpdate
 static void __cdecl on_late_update_callback()
 {
@@ -84,8 +77,6 @@ bool initialize()
                             reinterpret_cast<const void*>(on_draw_menu));
     mono::add_internal_call("Payload.Bridge::OnUpdateCallback",
                             reinterpret_cast<const void*>(on_update_callback));
-    mono::add_internal_call("Payload.Bridge::OnAntiCheatCallback",
-                            reinterpret_cast<const void*>(on_anticheat_callback));
     mono::add_internal_call("Payload.Bridge::OnLateUpdateCallback",
                             reinterpret_cast<const void*>(on_late_update_callback));
 
